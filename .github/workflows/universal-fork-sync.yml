@@ -23,6 +23,37 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+            - name: Verify token permissions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          headers="$(gh api --include user 2>/dev/null | tr -d '\r')"
+
+          scopes="$(
+            printf '%s\n' "$headers" |
+            awk -F': ' 'tolower($1) == "x-oauth-scopes" { print $2 }'
+          )"
+
+          echo "Token scopes reported by GitHub: ${scopes:-none}"
+
+          normalized=",${scopes// /},"
+
+          if [[ "$normalized" != *",workflow,"* ]]; then
+            echo "::error::FORK_SYNC_TOKEN does not have the workflow scope."
+            exit 1
+          fi
+
+          if [[ "$normalized" != *",repo,"* &&
+                "$normalized" != *",public_repo,"* ]]; then
+            echo "::error::FORK_SYNC_TOKEN does not have repo or public_repo scope."
+            exit 1
+          fi
+
+          echo "Required token scopes are present."
+          
       - name: Sync forks
         shell: bash
         env:
