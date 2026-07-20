@@ -1,15 +1,13 @@
 name: Universal Fork Sync
 
 on:
-  # Automatically run every 6 hours.
   schedule:
+    # Run every 6 hours, at 17 minutes past the hour.
     - cron: "17 */6 * * *"
 
-  # Also provide a Run workflow button for manual testing.
+  # Adds a manual "Run workflow" button.
   workflow_dispatch:
 
-# The built-in token does not need write access.
-# Repository updates use FORK_SYNC_TOKEN instead.
 permissions:
   contents: read
 
@@ -21,9 +19,30 @@ jobs:
   sync-all-forks:
     name: Find and force-sync all forks
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-            - name: Verify token permissions
+      - name: Verify token
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "Checking GitHub authentication..."
+
+          gh auth status
+
+          owner="$(gh api user --jq '.login')"
+
+          if [[ -z "$owner" ]]; then
+            echo "::error::The token could not identify your GitHub account."
+            exit 1
+          fi
+
+          echo "Authenticated as: $owner"
+
+      - name: Check classic token scopes
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
@@ -39,39 +58,37 @@ jobs:
 
           echo "Token scopes reported by GitHub: ${scopes:-none}"
 
-          normalized=",${scopes// /},"
-
-          if [[ "$normalized" != *",workflow,"* ]]; then
-            echo "::error::FORK_SYNC_TOKEN does not have the workflow scope."
+          if [[ -z "$scopes" ]]; then
+            echo "::error::No classic token scopes were detected."
+            echo "::error::FORK_SYNC_TOKEN should contain a classic personal access token beginning with ghp_."
             exit 1
           fi
+
+          normalized=",${scopes// /},"
 
           if [[ "$normalized" != *",repo,"* &&
                 "$normalized" != *",public_repo,"* ]]; then
-            echo "::error::FORK_SYNC_TOKEN does not have repo or public_repo scope."
+            echo "::error::The token is missing the repo or public_repo scope."
             exit 1
           fi
 
-          echo "Required token scopes are present."
-          
-      - name: Sync forks
+          if [[ "$normalized" != *",workflow,"* ]]; then
+            echo "::error::The token is missing the workflow scope."
+            exit 1
+          fi
+
+          echo "The required repository and workflow scopes are present."
+
+      - name: Find and sync forks
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
         run: |
           set -uo pipefail
 
-          echo "Finding the GitHub account connected to the token..."
-
           owner="$(gh api user --jq '.login')"
 
-          if [[ -z "$owner" ]]; then
-            echo "::error::Could not determine the GitHub account."
-            exit 1
-          fi
-
-          echo "Authenticated as: $owner"
-          echo "Searching for non-archived forks..."
+          echo "Searching for non-archived forks owned by $owner..."
 
           mapfile -t forks < <(
             gh repo list "$owner" \
@@ -92,8 +109,8 @@ jobs:
           echo "Found $fork_count fork(s)."
           echo
 
-          failures=0
           successes=0
+          failures=0
 
           for repository in "${forks[@]}"; do
             echo "::group::Syncing $repository"
