@@ -1,0 +1,90 @@
+name: Universal Fork Sync
+
+on:
+  # Automatically run every 6 hours.
+  schedule:
+    - cron: "17 */6 * * *"
+
+  # Also provide a Run workflow button for manual testing.
+  workflow_dispatch:
+
+# The built-in token does not need write access.
+# Repository updates use FORK_SYNC_TOKEN instead.
+permissions:
+  contents: read
+
+concurrency:
+  group: universal-fork-sync
+  cancel-in-progress: false
+
+jobs:
+  sync-all-forks:
+    name: Find and force-sync all forks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Sync forks
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          echo "Finding the GitHub account connected to the token..."
+
+          owner="$(gh api user --jq '.login')"
+
+          if [[ -z "$owner" ]]; then
+            echo "::error::Could not determine the GitHub account."
+            exit 1
+          fi
+
+          echo "Authenticated as: $owner"
+          echo "Searching for non-archived forks..."
+
+          mapfile -t forks < <(
+            gh repo list "$owner" \
+              --fork \
+              --no-archived \
+              --limit 1000 \
+              --json nameWithOwner \
+              --jq '.[].nameWithOwner'
+          )
+
+          fork_count="${#forks[@]}"
+
+          if (( fork_count == 0 )); then
+            echo "No active forks were found."
+            exit 0
+          fi
+
+          echo "Found $fork_count fork(s)."
+          echo
+
+          failures=0
+          successes=0
+
+          for repository in "${forks[@]}"; do
+            echo "::group::Syncing $repository"
+
+            if gh repo sync "$repository" --force; then
+              echo "Successfully synced: $repository"
+              successes=$((successes + 1))
+            else
+              echo "::error::Failed to sync: $repository"
+              failures=$((failures + 1))
+            fi
+
+            echo "::endgroup::"
+          done
+
+          echo
+          echo "Synchronization summary"
+          echo "-----------------------"
+          echo "Forks found: $fork_count"
+          echo "Successful:  $successes"
+          echo "Failed:      $failures"
+
+          if (( failures > 0 )); then
+            exit 1
+          fi
