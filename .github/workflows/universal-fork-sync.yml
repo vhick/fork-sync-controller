@@ -79,10 +79,19 @@ jobs:
 
           echo "The required repository and workflow scopes are present."
 
-      - name: Find and sync forks
+      - name: Find, sync forks, and trigger ZyntaxAI portable build when changed
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+
+          # IMPORTANT:
+          # Use these exact repository names to avoid any editing:
+          #   your-account/ZyntaxAI
+          #   your-account/ZyntaxAI-Portable-Builder
+          ZYNTAX_FORK_NAME: ZyntaxAI
+          ZYNTAX_BUILDER_NAME: ZyntaxAI-Portable-Builder
+          ZYNTAX_BUILDER_WORKFLOW: build-portable.yml
+
         run: |
           set -uo pipefail
 
@@ -111,13 +120,72 @@ jobs:
 
           successes=0
           failures=0
+          zyntax_changed=0
+          zyntax_triggered=0
 
           for repository in "${forks[@]}"; do
             echo "::group::Syncing $repository"
 
+            default_branch="$(
+              gh api "repos/$repository" --jq '.default_branch' 2>/dev/null
+            )"
+
+            if [[ -z "$default_branch" ]]; then
+              echo "::error::Could not determine default branch for $repository"
+              failures=$((failures + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            before_sha="$(
+              gh api "repos/$repository/commits/$default_branch" --jq '.sha' 2>/dev/null
+            )"
+
+            echo "Default branch: $default_branch"
+            echo "Before sync:    ${before_sha:-unknown}"
+
             if gh repo sync "$repository" --force; then
               echo "Successfully synced: $repository"
               successes=$((successes + 1))
+
+              after_sha="$(
+                gh api "repos/$repository/commits/$default_branch" --jq '.sha' 2>/dev/null
+              )"
+
+              echo "After sync:     ${after_sha:-unknown}"
+
+              # Special integration for your ZyntaxAI fork.
+              if [[ "$repository" == "$owner/$ZYNTAX_FORK_NAME" ]]; then
+                if [[ -n "$before_sha" &&
+                      -n "$after_sha" &&
+                      "$before_sha" != "$after_sha" ]]; then
+
+                  zyntax_changed=1
+
+                  builder_repo="$owner/$ZYNTAX_BUILDER_NAME"
+
+                  echo "ZyntaxAI changed."
+                  echo "Triggering portable builder:"
+                  echo "  $builder_repo"
+
+                  if gh workflow run "$ZYNTAX_BUILDER_WORKFLOW" \
+                        --repo "$builder_repo" \
+                        --ref main \
+                        --raw-field mode=portable-data \
+                        --raw-field upstream_repo="$repository" \
+                        --raw-field upstream_ref="$default_branch"; then
+
+                    echo "Portable build workflow was triggered successfully."
+                    zyntax_triggered=1
+                  else
+                    echo "::error::ZyntaxAI synced, but the portable builder could not be triggered."
+                    echo "::error::Make sure $builder_repo exists and contains .github/workflows/$ZYNTAX_BUILDER_WORKFLOW"
+                    failures=$((failures + 1))
+                  fi
+                else
+                  echo "ZyntaxAI has no new commit. Portable build not needed."
+                fi
+              fi
             else
               echo "::error::Failed to sync: $repository"
               failures=$((failures + 1))
@@ -129,9 +197,11 @@ jobs:
           echo
           echo "Synchronization summary"
           echo "-----------------------"
-          echo "Forks found: $fork_count"
-          echo "Successful:  $successes"
-          echo "Failed:      $failures"
+          echo "Forks found:               $fork_count"
+          echo "Successful syncs:          $successes"
+          echo "Failures:                  $failures"
+          echo "ZyntaxAI changed:          $zyntax_changed"
+          echo "ZyntaxAI builder triggered:$zyntax_triggered"
 
           if (( failures > 0 )); then
             exit 1
