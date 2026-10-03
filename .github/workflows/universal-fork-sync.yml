@@ -121,6 +121,9 @@ jobs:
               GemType)
                 builder_name="GemType-Portable-Builder"
                 ;;
+              yasb)
+                builder_name="YASB-Portable-Builder"
+                ;;
               *)
                 return 0
                 ;;
@@ -188,7 +191,7 @@ jobs:
                 trigger_portable_builder "$repository" "$default_branch"
               else
                 case "${repository#*/}" in
-                  ZyntaxAI|GemType)
+                  ZyntaxAI|GemType|yasb)
                     echo "${repository#*/} has no new commit. Portable build not needed."
                     ;;
                 esac
