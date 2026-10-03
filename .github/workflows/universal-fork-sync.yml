@@ -2,7 +2,10 @@ name: Universal Fork Sync
 
 on:
   schedule:
+    # Run every 6 hours, at 17 minutes past the hour.
     - cron: "17 */6 * * *"
+
+  # Adds a manual "Run workflow" button.
   workflow_dispatch:
 
 permissions:
@@ -16,7 +19,7 @@ jobs:
   sync-all-forks:
     name: Find and force-sync all forks
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Verify token
@@ -56,7 +59,7 @@ jobs:
 
           if [[ -z "$scopes" ]]; then
             echo "::error::No classic token scopes were detected."
-            echo "::error::FORK_SYNC_TOKEN should contain a classic PAT."
+            echo "::error::FORK_SYNC_TOKEN should contain a classic personal access token beginning with ghp_."
             exit 1
           fi
 
@@ -64,21 +67,33 @@ jobs:
 
           if [[ "$normalized" != *",repo,"* &&
                 "$normalized" != *",public_repo,"* ]]; then
-            echo "::error::The token is missing repo or public_repo."
+            echo "::error::The token is missing the repo or public_repo scope."
             exit 1
           fi
 
           if [[ "$normalized" != *",workflow,"* ]]; then
-            echo "::error::The token is missing workflow."
+            echo "::error::The token is missing the workflow scope."
             exit 1
           fi
 
-          echo "Required scopes are present."
+          echo "The required repository and workflow scopes are present."
 
-      - name: Find, sync forks, and trigger portable builders when changed
+      - name: Find forks, sync them, and trigger portable builders
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+
+          # Existing ZyntaxAI integration.
+          ZYNTAX_FORK_NAME: ZyntaxAI
+          ZYNTAX_BUILDER_NAME: ZyntaxAI-Portable-Builder
+          ZYNTAX_BUILDER_WORKFLOW: build-portable.yml
+
+          # Komorebi true-portable integration.
+          KOMOREBI_FORK_NAME: komorebi
+          WHKD_FORK_NAME: whkd
+          KOMOREBI_BUILDER_NAME: Komorebi-Portable-Builder
+          KOMOREBI_BUILDER_WORKFLOW: build-portable.yml
+
         run: |
           set -uo pipefail
 
@@ -102,57 +117,15 @@ jobs:
             exit 0
           fi
 
-          successes=0
-          failures=0
-          portable_changes=0
-          portable_triggers=0
-
-          trigger_portable_builder() {
-            local repository="$1"
-            local default_branch="$2"
-            local fork_name="${repository#*/}"
-            local builder_name=""
-            local workflow_file="build-portable.yml"
-
-            case "$fork_name" in
-              ZyntaxAI)
-                builder_name="ZyntaxAI-Portable-Builder"
-                ;;
-              GemType)
-                builder_name="GemType-Portable-Builder"
-                ;;
-              yasb)
-                builder_name="YASB-Portable-Builder"
-                ;;
-              *)
-                return 0
-                ;;
-            esac
-
-            portable_changes=$((portable_changes + 1))
-            builder_repo="$owner/$builder_name"
-
-            echo "$fork_name changed."
-            echo "Triggering: $builder_repo"
-
-            if gh workflow run "$workflow_file" \
-                  --repo "$builder_repo" \
-                  --ref main \
-                  --raw-field mode=portable-data \
-                  --raw-field upstream_repo="$repository" \
-                  --raw-field upstream_ref="$default_branch"; then
-
-              echo "Portable build triggered successfully."
-              portable_triggers=$((portable_triggers + 1))
-            else
-              echo "::error::$fork_name synced, but $builder_repo could not be triggered."
-              echo "::error::Confirm $builder_repo contains .github/workflows/$workflow_file"
-              failures=$((failures + 1))
-            fi
-          }
-
           echo "Found $fork_count fork(s)."
           echo
+
+          successes=0
+          failures=0
+
+          zyntax_changed=0
+          komorebi_changed=0
+          whkd_changed=0
 
           for repository in "${forks[@]}"; do
             echo "::group::Syncing $repository"
@@ -177,7 +150,6 @@ jobs:
 
             if gh repo sync "$repository" --force; then
               successes=$((successes + 1))
-              echo "Successfully synced: $repository"
 
               after_sha="$(
                 gh api "repos/$repository/commits/$default_branch" --jq '.sha' 2>/dev/null
@@ -188,13 +160,24 @@ jobs:
               if [[ -n "$before_sha" &&
                     -n "$after_sha" &&
                     "$before_sha" != "$after_sha" ]]; then
-                trigger_portable_builder "$repository" "$default_branch"
+
+                echo "New upstream commit detected."
+
+                repo_name="${repository#*/}"
+
+                if [[ "${repo_name,,}" == "${ZYNTAX_FORK_NAME,,}" ]]; then
+                  zyntax_changed=1
+                fi
+
+                if [[ "${repo_name,,}" == "${KOMOREBI_FORK_NAME,,}" ]]; then
+                  komorebi_changed=1
+                fi
+
+                if [[ "${repo_name,,}" == "${WHKD_FORK_NAME,,}" ]]; then
+                  whkd_changed=1
+                fi
               else
-                case "${repository#*/}" in
-                  ZyntaxAI|GemType|yasb)
-                    echo "${repository#*/} has no new commit. Portable build not needed."
-                    ;;
-                esac
+                echo "Already up to date."
               fi
             else
               echo "::error::Failed to sync: $repository"
@@ -205,13 +188,63 @@ jobs:
           done
 
           echo
+          echo "Portable build trigger phase"
+          echo "----------------------------"
+
+          # Preserve the ZyntaxAI automation if that builder exists.
+          if (( zyntax_changed == 1 )); then
+            builder="$owner/$ZYNTAX_BUILDER_NAME"
+
+            if gh repo view "$builder" >/dev/null 2>&1; then
+              echo "Triggering ZyntaxAI portable builder..."
+
+              if ! gh workflow run "$ZYNTAX_BUILDER_WORKFLOW" \
+                    --repo "$builder" \
+                    --ref main \
+                    --raw-field mode=portable-data \
+                    --raw-field upstream_repo="$owner/$ZYNTAX_FORK_NAME" \
+                    --raw-field upstream_ref=main; then
+                echo "::error::Could not trigger $builder"
+                failures=$((failures + 1))
+              fi
+            else
+              echo "::warning::$builder does not exist; ZyntaxAI build trigger skipped."
+            fi
+          fi
+
+          # Komorebi and whkd are built as one portable package.
+          # Trigger ONCE if either clean fork changed during this sync run.
+          if (( komorebi_changed == 1 || whkd_changed == 1 )); then
+            builder="$owner/$KOMOREBI_BUILDER_NAME"
+
+            if gh repo view "$builder" >/dev/null 2>&1; then
+              echo "Triggering Komorebi + whkd portable builder..."
+
+              if ! gh workflow run "$KOMOREBI_BUILDER_WORKFLOW" \
+                    --repo "$builder" \
+                    --ref main \
+                    --raw-field mode=portable-data \
+                    --raw-field komorebi_repo="$owner/$KOMOREBI_FORK_NAME" \
+                    --raw-field komorebi_ref=master \
+                    --raw-field whkd_repo="$owner/$WHKD_FORK_NAME" \
+                    --raw-field whkd_ref=master; then
+                echo "::error::Could not trigger $builder"
+                failures=$((failures + 1))
+              fi
+            else
+              echo "::warning::$builder does not exist; Komorebi build trigger skipped."
+            fi
+          fi
+
+          echo
           echo "Synchronization summary"
           echo "-----------------------"
-          echo "Forks found:                $fork_count"
-          echo "Successful syncs:           $successes"
-          echo "Portable fork changes:      $portable_changes"
-          echo "Portable builders triggered:$portable_triggers"
-          echo "Failures:                   $failures"
+          echo "Forks found:        $fork_count"
+          echo "Successful syncs:   $successes"
+          echo "Failures:           $failures"
+          echo "ZyntaxAI changed:   $zyntax_changed"
+          echo "komorebi changed:   $komorebi_changed"
+          echo "whkd changed:       $whkd_changed"
 
           if (( failures > 0 )); then
             exit 1
