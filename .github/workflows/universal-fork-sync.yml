@@ -2,10 +2,7 @@ name: Universal Fork Sync
 
 on:
   schedule:
-    # Run every 6 hours, at 17 minutes past the hour.
     - cron: "17 */6 * * *"
-
-  # Adds a manual "Run workflow" button.
   workflow_dispatch:
 
 permissions:
@@ -19,7 +16,7 @@ jobs:
   sync-all-forks:
     name: Find and force-sync all forks
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 40
 
     steps:
       - name: Verify token
@@ -28,17 +25,12 @@ jobs:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
         run: |
           set -euo pipefail
-
-          echo "Checking GitHub authentication..."
           gh auth status
-
           owner="$(gh api user --jq '.login')"
-
           if [[ -z "$owner" ]]; then
             echo "::error::The token could not identify your GitHub account."
             exit 1
           fi
-
           echo "Authenticated as: $owner"
 
       - name: Check classic token scopes
@@ -47,59 +39,31 @@ jobs:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
         run: |
           set -euo pipefail
-
           headers="$(gh api --include user 2>/dev/null | tr -d '\r')"
-
-          scopes="$(
-            printf '%s\n' "$headers" |
-            awk -F': ' 'tolower($1) == "x-oauth-scopes" { print $2 }'
-          )"
-
-          echo "Token scopes reported by GitHub: ${scopes:-none}"
-
-          if [[ -z "$scopes" ]]; then
-            echo "::error::No classic token scopes were detected."
-            echo "::error::FORK_SYNC_TOKEN should contain a classic personal access token beginning with ghp_."
-            exit 1
-          fi
+          scopes="$(printf '%s\n' "$headers" | awk -F': ' 'tolower($1) == "x-oauth-scopes" { print $2 }')"
+          echo "Token scopes: ${scopes:-none}"
 
           normalized=",${scopes// /},"
 
           if [[ "$normalized" != *",repo,"* &&
                 "$normalized" != *",public_repo,"* ]]; then
-            echo "::error::The token is missing the repo or public_repo scope."
+            echo "::error::The token is missing repo or public_repo."
             exit 1
           fi
 
           if [[ "$normalized" != *",workflow,"* ]]; then
-            echo "::error::The token is missing the workflow scope."
+            echo "::error::The token is missing workflow."
             exit 1
           fi
 
-          echo "The required repository and workflow scopes are present."
-
-      - name: Find forks, sync them, and trigger portable builders
+      - name: Sync forks and trigger portable builders
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
-
-          # Existing ZyntaxAI integration.
-          ZYNTAX_FORK_NAME: ZyntaxAI
-          ZYNTAX_BUILDER_NAME: ZyntaxAI-Portable-Builder
-          ZYNTAX_BUILDER_WORKFLOW: build-portable.yml
-
-          # Komorebi true-portable integration.
-          KOMOREBI_FORK_NAME: komorebi
-          WHKD_FORK_NAME: whkd
-          KOMOREBI_BUILDER_NAME: Komorebi-Portable-Builder
-          KOMOREBI_BUILDER_WORKFLOW: build-portable.yml
-
         run: |
           set -uo pipefail
 
           owner="$(gh api user --jq '.login')"
-
-          echo "Searching for non-archived forks owned by $owner..."
 
           mapfile -t forks < <(
             gh repo list "$owner" \
@@ -110,74 +74,50 @@ jobs:
               --jq '.[].nameWithOwner'
           )
 
-          fork_count="${#forks[@]}"
-
-          if (( fork_count == 0 )); then
+          if (( ${#forks[@]} == 0 )); then
             echo "No active forks were found."
             exit 0
           fi
-
-          echo "Found $fork_count fork(s)."
-          echo
 
           successes=0
           failures=0
 
           zyntax_changed=0
-          komorebi_changed=0
-          whkd_changed=0
+          gemtype_changed=0
+          yasb_changed=0
+          komorebi_bundle_changed=0
 
           for repository in "${forks[@]}"; do
             echo "::group::Syncing $repository"
 
-            default_branch="$(
-              gh api "repos/$repository" --jq '.default_branch' 2>/dev/null
-            )"
-
-            if [[ -z "$default_branch" ]]; then
-              echo "::error::Could not determine default branch for $repository"
-              failures=$((failures + 1))
-              echo "::endgroup::"
-              continue
-            fi
-
-            before_sha="$(
-              gh api "repos/$repository/commits/$default_branch" --jq '.sha' 2>/dev/null
-            )"
-
-            echo "Default branch: $default_branch"
-            echo "Before sync:    ${before_sha:-unknown}"
+            default_branch="$(gh api "repos/$repository" --jq '.default_branch' 2>/dev/null)"
+            before_sha="$(gh api "repos/$repository/commits/$default_branch" --jq '.sha' 2>/dev/null)"
 
             if gh repo sync "$repository" --force; then
               successes=$((successes + 1))
+              after_sha="$(gh api "repos/$repository/commits/$default_branch" --jq '.sha' 2>/dev/null)"
 
-              after_sha="$(
-                gh api "repos/$repository/commits/$default_branch" --jq '.sha' 2>/dev/null
-              )"
-
-              echo "After sync:     ${after_sha:-unknown}"
+              echo "Before: ${before_sha:-unknown}"
+              echo "After:  ${after_sha:-unknown}"
 
               if [[ -n "$before_sha" &&
                     -n "$after_sha" &&
                     "$before_sha" != "$after_sha" ]]; then
 
-                echo "New upstream commit detected."
-
-                repo_name="${repository#*/}"
-
-                if [[ "${repo_name,,}" == "${ZYNTAX_FORK_NAME,,}" ]]; then
-                  zyntax_changed=1
-                fi
-
-                if [[ "${repo_name,,}" == "${KOMOREBI_FORK_NAME,,}" ]]; then
-                  komorebi_changed=1
-                fi
-
-                if [[ "${repo_name,,}" == "${WHKD_FORK_NAME,,}" ]]; then
-                  whkd_changed=1
-                fi
-              else
-                echo "Already up to date."
+                case "${repository#*/}" in
+                  ZyntaxAI)
+                    zyntax_changed=1
+                    ;;
+                  GemType)
+                    gemtype_changed=1
+                    ;;
+                  yasb)
+                    yasb_changed=1
+                    ;;
+                  komorebi|whkd)
+                    komorebi_bundle_changed=1
+                    ;;
+                esac
               fi
             else
               echo "::error::Failed to sync: $repository"
@@ -187,64 +127,69 @@ jobs:
             echo "::endgroup::"
           done
 
-          echo
-          echo "Portable build trigger phase"
-          echo "----------------------------"
+          trigger_standard_builder() {
+            local builder="$1"
+            local source_repo="$2"
+            local source_ref="$3"
 
-          # Preserve the ZyntaxAI automation if that builder exists.
-          if (( zyntax_changed == 1 )); then
-            builder="$owner/$ZYNTAX_BUILDER_NAME"
+            echo "Triggering $owner/$builder from $source_repo@$source_ref"
 
-            if gh repo view "$builder" >/dev/null 2>&1; then
-              echo "Triggering ZyntaxAI portable builder..."
-
-              if ! gh workflow run "$ZYNTAX_BUILDER_WORKFLOW" \
-                    --repo "$builder" \
-                    --ref main \
-                    --raw-field mode=portable-data \
-                    --raw-field upstream_repo="$owner/$ZYNTAX_FORK_NAME" \
-                    --raw-field upstream_ref=main; then
-                echo "::error::Could not trigger $builder"
-                failures=$((failures + 1))
-              fi
-            else
-              echo "::warning::$builder does not exist; ZyntaxAI build trigger skipped."
+            if ! gh workflow run build-portable.yml \
+                  --repo "$owner/$builder" \
+                  --ref main \
+                  --raw-field mode=portable-data \
+                  --raw-field upstream_repo="$source_repo" \
+                  --raw-field upstream_ref="$source_ref"; then
+              echo "::error::Could not trigger $builder"
+              failures=$((failures + 1))
             fi
+          }
+
+          if (( zyntax_changed )); then
+            ref="$(gh api "repos/$owner/ZyntaxAI" --jq '.default_branch')"
+            trigger_standard_builder "ZyntaxAI-Portable-Builder" "$owner/ZyntaxAI" "$ref"
           fi
 
-          # Komorebi and whkd are built as one portable package.
-          # Trigger ONCE if either clean fork changed during this sync run.
-          if (( komorebi_changed == 1 || whkd_changed == 1 )); then
-            builder="$owner/$KOMOREBI_BUILDER_NAME"
+          if (( gemtype_changed )); then
+            ref="$(gh api "repos/$owner/GemType" --jq '.default_branch')"
+            trigger_standard_builder "GemType-Portable-Builder" "$owner/GemType" "$ref"
+          fi
 
-            if gh repo view "$builder" >/dev/null 2>&1; then
-              echo "Triggering Komorebi + whkd portable builder..."
+          if (( yasb_changed )); then
+            ref="$(gh api "repos/$owner/yasb" --jq '.default_branch')"
+            trigger_standard_builder "YASB-Portable-Builder" "$owner/yasb" "$ref"
+          fi
 
-              if ! gh workflow run "$KOMOREBI_BUILDER_WORKFLOW" \
-                    --repo "$builder" \
-                    --ref main \
-                    --raw-field mode=portable-data \
-                    --raw-field komorebi_repo="$owner/$KOMOREBI_FORK_NAME" \
-                    --raw-field komorebi_ref=master \
-                    --raw-field whkd_repo="$owner/$WHKD_FORK_NAME" \
-                    --raw-field whkd_ref=master; then
-                echo "::error::Could not trigger $builder"
-                failures=$((failures + 1))
-              fi
-            else
-              echo "::warning::$builder does not exist; Komorebi build trigger skipped."
+          # komorebi and whkd are one portable bundle. Trigger once if either changed.
+          if (( komorebi_bundle_changed )); then
+            komorebi_ref="$(gh api "repos/$owner/komorebi" --jq '.default_branch')"
+            whkd_ref="$(gh api "repos/$owner/whkd" --jq '.default_branch')"
+
+            echo "Triggering private Komorebi bundle builder"
+
+            if ! gh workflow run build-portable.yml \
+                  --repo "$owner/Komorebi-Portable-Builder" \
+                  --ref main \
+                  --raw-field mode=portable-data \
+                  --raw-field komorebi_repo="$owner/komorebi" \
+                  --raw-field komorebi_ref="$komorebi_ref" \
+                  --raw-field whkd_repo="$owner/whkd" \
+                  --raw-field whkd_ref="$whkd_ref"; then
+              echo "::error::Could not trigger Komorebi-Portable-Builder"
+              failures=$((failures + 1))
             fi
           fi
 
           echo
           echo "Synchronization summary"
           echo "-----------------------"
-          echo "Forks found:        $fork_count"
-          echo "Successful syncs:   $successes"
-          echo "Failures:           $failures"
-          echo "ZyntaxAI changed:   $zyntax_changed"
-          echo "komorebi changed:   $komorebi_changed"
-          echo "whkd changed:       $whkd_changed"
+          echo "Forks found: ${#forks[@]}"
+          echo "Successful syncs: $successes"
+          echo "Failures: $failures"
+          echo "ZyntaxAI changed: $zyntax_changed"
+          echo "GemType changed: $gemtype_changed"
+          echo "YASB changed: $yasb_changed"
+          echo "Komorebi/whkd bundle changed: $komorebi_bundle_changed"
 
           if (( failures > 0 )); then
             exit 1
