@@ -84,6 +84,7 @@ jobs:
 
           zyntax_changed=0
           gemtype_changed=0
+          pake_changed=0
           yasb_changed=0
           komorebi_bundle_changed=0
 
@@ -110,6 +111,9 @@ jobs:
                     ;;
                   GemType)
                     gemtype_changed=1
+                    ;;
+                  Pake)
+                    pake_changed=1
                     ;;
                   yasb)
                     yasb_changed=1
@@ -155,6 +159,24 @@ jobs:
             trigger_standard_builder "GemType-Portable-Builder" "$owner/GemType" "$ref"
           fi
 
+          # Pake is a builder for multiple saved apps, so use rebuild-saved
+          # instead of the standard portable-data mode.
+          if (( pake_changed )); then
+            ref="$(gh api "repos/$owner/Pake" --jq '.default_branch')"
+
+            echo "Triggering $owner/Pake-Portable-Builder from $owner/Pake@$ref"
+
+            if ! gh workflow run build-portable.yml \
+                  --repo "$owner/Pake-Portable-Builder" \
+                  --ref main \
+                  --raw-field mode=rebuild-saved \
+                  --raw-field upstream_repo="$owner/Pake" \
+                  --raw-field upstream_ref="$ref"; then
+              echo "::error::Could not trigger Pake-Portable-Builder"
+              failures=$((failures + 1))
+            fi
+          fi
+
           if (( yasb_changed )); then
             ref="$(gh api "repos/$owner/yasb" --jq '.default_branch')"
             trigger_standard_builder "YASB-Portable-Builder" "$owner/yasb" "$ref"
@@ -188,6 +210,7 @@ jobs:
           echo "Failures: $failures"
           echo "ZyntaxAI changed: $zyntax_changed"
           echo "GemType changed: $gemtype_changed"
+          echo "Pake changed: $pake_changed"
           echo "YASB changed: $yasb_changed"
           echo "Komorebi/whkd bundle changed: $komorebi_bundle_changed"
 
