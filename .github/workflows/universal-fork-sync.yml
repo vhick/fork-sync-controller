@@ -86,6 +86,7 @@ jobs:
           gemtype_changed=0
           pake_changed=0
           yasb_changed=0
+          brave_free_origin_changed=0
           komorebi_bundle_changed=0
 
           for repository in "${forks[@]}"; do
@@ -117,6 +118,9 @@ jobs:
                     ;;
                   yasb)
                     yasb_changed=1
+                    ;;
+                  Brave-Free-Origin)
+                    brave_free_origin_changed=1
                     ;;
                   komorebi|whkd)
                     komorebi_bundle_changed=1
@@ -182,6 +186,24 @@ jobs:
             trigger_standard_builder "YASB-Portable-Builder" "$owner/yasb" "$ref"
           fi
 
+          # Brave Free Origin's builder uses source_repo/source_ref rather than
+          # the upstream_repo/upstream_ref fields used by the standard builders.
+          if (( brave_free_origin_changed )); then
+            ref="$(gh api "repos/$owner/Brave-Free-Origin" --jq '.default_branch')"
+
+            echo "Triggering $owner/Brave-Free-Origin-Portable-Builder from $owner/Brave-Free-Origin@$ref"
+
+            if ! gh workflow run build-portable.yml \
+                  --repo "$owner/Brave-Free-Origin-Portable-Builder" \
+                  --ref main \
+                  --raw-field mode=portable-data \
+                  --raw-field source_repo="$owner/Brave-Free-Origin" \
+                  --raw-field source_ref="$ref"; then
+              echo "::error::Could not trigger Brave-Free-Origin-Portable-Builder"
+              failures=$((failures + 1))
+            fi
+          fi
+
           # komorebi and whkd are one portable bundle. Trigger once if either changed.
           if (( komorebi_bundle_changed )); then
             komorebi_ref="$(gh api "repos/$owner/komorebi" --jq '.default_branch')"
@@ -212,6 +234,7 @@ jobs:
           echo "GemType changed: $gemtype_changed"
           echo "Pake changed: $pake_changed"
           echo "YASB changed: $yasb_changed"
+          echo "Brave Free Origin changed: $brave_free_origin_changed"
           echo "Komorebi/whkd bundle changed: $komorebi_bundle_changed"
 
           if (( failures > 0 )); then
