@@ -88,6 +88,7 @@ jobs:
           yasb_changed=0
           brave_free_origin_changed=0
           komorebi_bundle_changed=0
+          telegram_drive_changed=0
 
           for repository in "${forks[@]}"; do
             echo "::group::Syncing $repository"
@@ -124,6 +125,9 @@ jobs:
                     ;;
                   komorebi|whkd)
                     komorebi_bundle_changed=1
+                    ;;
+                  Telegram-Drive)
+                    telegram_drive_changed=1
                     ;;
                 esac
               fi
@@ -224,6 +228,24 @@ jobs:
             fi
           fi
 
+          # Telegram Drive Phase 1 uses filesystem-portable, NOT portable-data.
+          # All other builder modes remain unchanged.
+          if (( telegram_drive_changed )); then
+            ref="$(gh api "repos/$owner/Telegram-Drive" --jq '.default_branch')"
+
+            echo "Triggering $owner/Telegram-Drive-Portable-Builder from $owner/Telegram-Drive@$ref"
+
+            if ! gh workflow run build-portable.yml \
+                  --repo "$owner/Telegram-Drive-Portable-Builder" \
+                  --ref main \
+                  --raw-field mode=filesystem-portable \
+                  --raw-field upstream_repo="$owner/Telegram-Drive" \
+                  --raw-field upstream_ref="$ref"; then
+              echo "::error::Could not trigger Telegram-Drive-Portable-Builder"
+              failures=$((failures + 1))
+            fi
+          fi
+
           echo
           echo "Synchronization summary"
           echo "-----------------------"
@@ -236,6 +258,7 @@ jobs:
           echo "YASB changed: $yasb_changed"
           echo "Brave Free Origin changed: $brave_free_origin_changed"
           echo "Komorebi/whkd bundle changed: $komorebi_bundle_changed"
+          echo "Telegram Drive changed: $telegram_drive_changed"
 
           if (( failures > 0 )); then
             exit 1
