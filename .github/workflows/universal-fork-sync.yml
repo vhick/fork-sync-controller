@@ -89,11 +89,21 @@ jobs:
           brave_free_origin_changed=0
           komorebi_bundle_changed=0
           telegram_drive_changed=0
+          qbz_downloader_changed=0
+          marktext_changed=0
+          marktext_fork_seen=0
+          marktext_default_branch=""
 
           for repository in "${forks[@]}"; do
             echo "::group::Syncing $repository"
 
             default_branch="$(gh api "repos/$repository" --jq '.default_branch' 2>/dev/null)"
+
+            if [[ "${repository#*/}" == "marktext" ]]; then
+              marktext_fork_seen=1
+              marktext_default_branch="$default_branch"
+            fi
+
             before_sha="$(gh api "repos/$repository/commits/$default_branch" --jq '.sha' 2>/dev/null)"
 
             if gh repo sync "$repository" --force; then
@@ -129,6 +139,15 @@ jobs:
                   Telegram-Drive)
                     telegram_drive_changed=1
                     ;;
+                  QBZ-Downloader)
+                    qbz_downloader_changed=1
+                    ;;
+                  marktext)
+                    # Both MarkText builders compile the develop branch.
+                    if [[ "$default_branch" == "develop" ]]; then
+                      marktext_changed=1
+                    fi
+                    ;;
                 esac
               fi
             else
@@ -138,6 +157,33 @@ jobs:
 
             echo "::endgroup::"
           done
+
+          # MarkText builders always use develop. If the fork's default branch
+          # is different, sync develop separately and compare its own commit.
+          # This avoids rebuilding MarkText for unrelated main-branch updates.
+          if (( marktext_fork_seen )) && [[ "$marktext_default_branch" != "develop" ]]; then
+            echo "::group::Syncing $owner/marktext develop (builder source branch)"
+            before_develop_sha="$(gh api "repos/$owner/marktext/commits/develop" --jq '.sha' 2>/dev/null)"
+
+            if [[ -z "$before_develop_sha" ]]; then
+              echo "::error::MarkText develop branch is missing or inaccessible."
+              failures=$((failures + 1))
+            elif gh repo sync "$owner/marktext" --branch develop --force; then
+              after_develop_sha="$(gh api "repos/$owner/marktext/commits/develop" --jq '.sha' 2>/dev/null)"
+              echo "MarkText develop before: $before_develop_sha"
+              echo "MarkText develop after:  ${after_develop_sha:-unknown}"
+              if [[ -z "$after_develop_sha" ]]; then
+                echo "::error::Cannot read the MarkText develop commit after syncing."
+                failures=$((failures + 1))
+              elif [[ "$before_develop_sha" != "$after_develop_sha" ]]; then
+                marktext_changed=1
+              fi
+            else
+              echo "::error::Failed to sync MarkText develop branch."
+              failures=$((failures + 1))
+            fi
+            echo "::endgroup::"
+          fi
 
           trigger_standard_builder() {
             local builder="$1"
@@ -153,6 +199,29 @@ jobs:
                   --raw-field upstream_repo="$source_repo" \
                   --raw-field upstream_ref="$source_ref"; then
               echo "::error::Could not trigger $builder"
+              failures=$((failures + 1))
+            fi
+          }
+
+          # Portable/PAF builders with custom workflow names and input keys.
+          # These builders do not accept mode=portable-data unless explicitly
+          # supplied in their own documented workflow.
+          trigger_variant_builder() {
+            local builder="$1"
+            local workflow="$2"
+            local source_repo="$3"
+            local source_ref="$4"
+            local repository_input="$5"
+            local branch_input="$6"
+
+            echo "Triggering $owner/$builder workflow $workflow from $source_repo@$source_ref"
+
+            if ! gh workflow run "$workflow" \
+                  --repo "$owner/$builder" \
+                  --ref main \
+                  --raw-field "$repository_input=$source_repo" \
+                  --raw-field "$branch_input=$source_ref"; then
+              echo "::error::Could not trigger $builder / $workflow"
               failures=$((failures + 1))
             fi
           }
@@ -246,6 +315,38 @@ jobs:
             fi
           fi
 
+          # Telegram Drive standalone was already configured above.
+          # Build its PortableApps-compatible EXE from the same synced revision.
+          if (( telegram_drive_changed )); then
+            ref="$(gh api "repos/$owner/Telegram-Drive" --jq '.default_branch')"
+            trigger_variant_builder "Telegram-Drive-Portable-Builder" \
+              "build-paf-portable.yml" "$owner/Telegram-Drive" "$ref" \
+              "upstream_repo" "upstream_ref"
+          fi
+
+          # QBZ: both build workflows use upstream_repo / upstream_ref,
+          # without a mode input. Preserve the independently working builds.
+          if (( qbz_downloader_changed )); then
+            ref="$(gh api "repos/$owner/QBZ-Downloader" --jq '.default_branch')"
+            trigger_variant_builder "QBZ-Downloader-Portable-Builder" \
+              "build-portable.yml" "$owner/QBZ-Downloader" "$ref" \
+              "upstream_repo" "upstream_ref"
+            trigger_variant_builder "QBZ-Downloader-Portable-Builder" \
+              "build-paf-portable.yml" "$owner/QBZ-Downloader" "$ref" \
+              "upstream_repo" "upstream_ref"
+          fi
+
+          # MarkText: both workflows use source_repository / source_ref
+          # and compile the develop branch, not necessarily the fork default.
+          if (( marktext_changed )); then
+            trigger_variant_builder "MarkText-Portable-Builder" \
+              "build-portable.yml" "$owner/marktext" "develop" \
+              "source_repository" "source_ref"
+            trigger_variant_builder "MarkText-Portable-Builder" \
+              "build-paf-portable.yml" "$owner/marktext" "develop" \
+              "source_repository" "source_ref"
+          fi
+
           echo
           echo "Synchronization summary"
           echo "-----------------------"
@@ -259,6 +360,8 @@ jobs:
           echo "Brave Free Origin changed: $brave_free_origin_changed"
           echo "Komorebi/whkd bundle changed: $komorebi_bundle_changed"
           echo "Telegram Drive changed: $telegram_drive_changed"
+          echo "QBZ-Downloader changed: $qbz_downloader_changed"
+          echo "MarkText develop changed: $marktext_changed"
 
           if (( failures > 0 )); then
             exit 1
