@@ -93,15 +93,23 @@ jobs:
           marktext_changed=0
           marktext_fork_seen=0
           marktext_default_branch=""
+          obs_studio_changed=0
+          obs_fork_seen=0
+          obs_default_branch=""
 
           for repository in "${forks[@]}"; do
             echo "::group::Syncing $repository"
 
             default_branch="$(gh api "repos/$repository" --jq '.default_branch' 2>/dev/null)"
 
+            # These source builders intentionally follow specific branches,
+            # even if the fork's default branch is different.
             if [[ "${repository#*/}" == "marktext" ]]; then
               marktext_fork_seen=1
               marktext_default_branch="$default_branch"
+            elif [[ "${repository#*/}" == "obs-studio" ]]; then
+              obs_fork_seen=1
+              obs_default_branch="$default_branch"
             fi
 
             before_sha="$(gh api "repos/$repository/commits/$default_branch" --jq '.sha' 2>/dev/null)"
@@ -143,9 +151,15 @@ jobs:
                     qbz_downloader_changed=1
                     ;;
                   marktext)
-                    # Both MarkText builders compile the develop branch.
+                    # MarkText compiles develop, not necessarily default branch.
                     if [[ "$default_branch" == "develop" ]]; then
                       marktext_changed=1
+                    fi
+                    ;;
+                  obs-studio)
+                    # OBS meeting builder compiles master, not necessarily default branch.
+                    if [[ "$default_branch" == "master" ]]; then
+                      obs_studio_changed=1
                     fi
                     ;;
                 esac
@@ -158,13 +172,11 @@ jobs:
             echo "::endgroup::"
           done
 
-          # MarkText builders always use develop. If the fork's default branch
-          # is different, sync develop separately and compare its own commit.
-          # This avoids rebuilding MarkText for unrelated main-branch updates.
+          # Sync non-default branches used by portable builders.
+          # Do not rebuild from unrelated changes to a fork's default branch.
           if (( marktext_fork_seen )) && [[ "$marktext_default_branch" != "develop" ]]; then
             echo "::group::Syncing $owner/marktext develop (builder source branch)"
             before_develop_sha="$(gh api "repos/$owner/marktext/commits/develop" --jq '.sha' 2>/dev/null)"
-
             if [[ -z "$before_develop_sha" ]]; then
               echo "::error::MarkText develop branch is missing or inaccessible."
               failures=$((failures + 1))
@@ -173,13 +185,36 @@ jobs:
               echo "MarkText develop before: $before_develop_sha"
               echo "MarkText develop after:  ${after_develop_sha:-unknown}"
               if [[ -z "$after_develop_sha" ]]; then
-                echo "::error::Cannot read the MarkText develop commit after syncing."
+                echo "::error::Cannot read MarkText develop commit after sync."
                 failures=$((failures + 1))
               elif [[ "$before_develop_sha" != "$after_develop_sha" ]]; then
                 marktext_changed=1
               fi
             else
-              echo "::error::Failed to sync MarkText develop branch."
+              echo "::error::Failed to sync MarkText develop."
+              failures=$((failures + 1))
+            fi
+            echo "::endgroup::"
+          fi
+
+          if (( obs_fork_seen )) && [[ "$obs_default_branch" != "master" ]]; then
+            echo "::group::Syncing $owner/obs-studio master (builder source branch)"
+            before_master_sha="$(gh api "repos/$owner/obs-studio/commits/master" --jq '.sha' 2>/dev/null)"
+            if [[ -z "$before_master_sha" ]]; then
+              echo "::error::OBS master branch is missing or inaccessible."
+              failures=$((failures + 1))
+            elif gh repo sync "$owner/obs-studio" --branch master --force; then
+              after_master_sha="$(gh api "repos/$owner/obs-studio/commits/master" --jq '.sha' 2>/dev/null)"
+              echo "OBS master before: $before_master_sha"
+              echo "OBS master after:  ${after_master_sha:-unknown}"
+              if [[ -z "$after_master_sha" ]]; then
+                echo "::error::Cannot read OBS master commit after sync."
+                failures=$((failures + 1))
+              elif [[ "$before_master_sha" != "$after_master_sha" ]]; then
+                obs_studio_changed=1
+              fi
+            else
+              echo "::error::Failed to sync OBS master."
               failures=$((failures + 1))
             fi
             echo "::endgroup::"
@@ -203,24 +238,21 @@ jobs:
             fi
           }
 
-          # Portable/PAF builders with custom workflow names and input keys.
-          # These builders do not accept mode=portable-data unless explicitly
-          # supplied in their own documented workflow.
+          # Dispatch builders that have app-specific workflow/input names.
+          # Keep the old standard builders untouched.
           trigger_variant_builder() {
             local builder="$1"
             local workflow="$2"
             local source_repo="$3"
             local source_ref="$4"
-            local repository_input="$5"
-            local branch_input="$6"
-
-            echo "Triggering $owner/$builder workflow $workflow from $source_repo@$source_ref"
-
+            local repo_key="$5"
+            local ref_key="$6"
+            echo "Triggering $owner/$builder / $workflow from $source_repo@$source_ref"
             if ! gh workflow run "$workflow" \
                   --repo "$owner/$builder" \
                   --ref main \
-                  --raw-field "$repository_input=$source_repo" \
-                  --raw-field "$branch_input=$source_ref"; then
+                  --raw-field "$repo_key=$source_repo" \
+                  --raw-field "$ref_key=$source_ref"; then
               echo "::error::Could not trigger $builder / $workflow"
               failures=$((failures + 1))
             fi
@@ -315,8 +347,8 @@ jobs:
             fi
           fi
 
-          # Telegram Drive standalone was already configured above.
-          # Build its PortableApps-compatible EXE from the same synced revision.
+          # Telegram Drive's original filesystem-portable standalone trigger
+          # is kept above; also rebuild the independent PAF package.
           if (( telegram_drive_changed )); then
             ref="$(gh api "repos/$owner/Telegram-Drive" --jq '.default_branch')"
             trigger_variant_builder "Telegram-Drive-Portable-Builder" \
@@ -324,8 +356,7 @@ jobs:
               "upstream_repo" "upstream_ref"
           fi
 
-          # QBZ: both build workflows use upstream_repo / upstream_ref,
-          # without a mode input. Preserve the independently working builds.
+          # QBZ has two standalone and PAF workflows with upstream_* inputs.
           if (( qbz_downloader_changed )); then
             ref="$(gh api "repos/$owner/QBZ-Downloader" --jq '.default_branch')"
             trigger_variant_builder "QBZ-Downloader-Portable-Builder" \
@@ -336,14 +367,23 @@ jobs:
               "upstream_repo" "upstream_ref"
           fi
 
-          # MarkText: both workflows use source_repository / source_ref
-          # and compile the develop branch, not necessarily the fork default.
+          # MarkText must be built from synced develop.
           if (( marktext_changed )); then
             trigger_variant_builder "MarkText-Portable-Builder" \
               "build-portable.yml" "$owner/marktext" "develop" \
               "source_repository" "source_ref"
             trigger_variant_builder "MarkText-Portable-Builder" \
               "build-paf-portable.yml" "$owner/marktext" "develop" \
+              "source_repository" "source_ref"
+          fi
+
+          # Custom OBS meeting-recorder build: ONE workflow only.
+          # This OVERRIDES the workflow's fixed verified SHA with the freshly
+          # synced master branch. New upstream code may fail source checks;
+          # that is deliberate and must be inspected, not automatically bypassed.
+          if (( obs_studio_changed )); then
+            trigger_variant_builder "OBS-Portable-Builder" \
+              "build-obs-meeting-portable.yml" "$owner/obs-studio" "master" \
               "source_repository" "source_ref"
           fi
 
@@ -362,6 +402,7 @@ jobs:
           echo "Telegram Drive changed: $telegram_drive_changed"
           echo "QBZ-Downloader changed: $qbz_downloader_changed"
           echo "MarkText develop changed: $marktext_changed"
+          echo "OBS Studio master changed: $obs_studio_changed"
 
           if (( failures > 0 )); then
             exit 1
