@@ -1,10 +1,19 @@
 name: Universal Fork Sync
 
+# This workflow ONLY updates GitHub forks. It NEVER runs portable builders.
 on:
   schedule:
-    - cron: "17 */6 * * *"
+    # Every six hours (UTC), matching your original workflow.
+    - cron: '17 */6 * * *'
   workflow_dispatch:
+    inputs:
+      force_sync:
+        description: 'DANGER: overwrite conflicting changes in fork branches?'
+        type: boolean
+        default: false
+        required: false
 
+# The separate FORK_SYNC_TOKEN is used for access to all your forks.
 permissions:
   contents: read
 
@@ -13,397 +22,161 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  sync-all-forks:
-    name: Find and force-sync all forks
+  sync-forks:
+    name: Automatically discover and sync all my forks
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+      FORCE_SYNC: ${{ inputs.force_sync || 'false' }}
 
     steps:
-      - name: Verify token
+      - name: Find all forks and sync their existing upstream branches
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
         run: |
-          set -euo pipefail
-          gh auth status
+          set -Eeuo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo '::error::FORK_SYNC_TOKEN secret is missing.'
+            exit 1
+          fi
+          gh auth status >/dev/null
           owner="$(gh api user --jq '.login')"
           if [[ -z "$owner" ]]; then
-            echo "::error::The token could not identify your GitHub account."
-            exit 1
-          fi
-          echo "Authenticated as: $owner"
-
-      - name: Check classic token scopes
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
-        run: |
-          set -euo pipefail
-          headers="$(gh api --include user 2>/dev/null | tr -d '\r')"
-          scopes="$(printf '%s\n' "$headers" | awk -F': ' 'tolower($1) == "x-oauth-scopes" { print $2 }')"
-          echo "Token scopes: ${scopes:-none}"
-
-          normalized=",${scopes// /},"
-
-          if [[ "$normalized" != *",repo,"* &&
-                "$normalized" != *",public_repo,"* ]]; then
-            echo "::error::The token is missing repo or public_repo."
+            echo '::error::Cannot identify the GitHub account for FORK_SYNC_TOKEN.'
             exit 1
           fi
 
-          if [[ "$normalized" != *",workflow,"* ]]; then
-            echo "::error::The token is missing workflow."
-            exit 1
-          fi
+          temp="$(mktemp -d)"
+          trap 'rm -rf "$temp"' EXIT
 
-      - name: Sync forks and trigger portable builders
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
-        run: |
-          set -uo pipefail
+          # Pagination means new forks are found automatically, even beyond 100 repos.
+          # Include public and private forks accessible to FORK_SYNC_TOKEN.
+          gh api --paginate 'user/repos?affiliation=owner&per_page=100' \
+            --jq '.[] | select(.fork == true and .archived == false and .disabled == false) | .full_name' \
+            > "$temp/forks.txt"
 
-          owner="$(gh api user --jq '.login')"
+          total="$(wc -l < "$temp/forks.txt" | tr -d ' ')"
+          echo "Account: $owner"
+          echo "Active forks found: $total"
+          echo "Force overwrite: $FORCE_SYNC"
 
-          mapfile -t forks < <(
-            gh repo list "$owner" \
-              --fork \
-              --no-archived \
-              --limit 1000 \
-              --json nameWithOwner \
-              --jq '.[].nameWithOwner'
-          )
+          {
+            echo '## Universal Fork Sync'
+            echo ''
+            echo "- GitHub account: \`$owner\`"
+            echo "- Active forks discovered: **$total**"
+            echo "- Force overwrite enabled: **$FORCE_SYNC**"
+            echo '- Portable builders launched: **0**'
+            echo ''
+            echo '| Fork | Original developer repo | Synced branches | Failed branches | Result |'
+            echo '|---|---|---:|---:|---|'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          if (( ${#forks[@]} == 0 )); then
-            echo "No active forks were found."
+          if (( total == 0 )); then
+            echo 'No accessible, active forks were found.'
             exit 0
           fi
 
-          successes=0
-          failures=0
+          repo_ok=0
+          repo_failed=0
+          branch_ok=0
+          branch_failed=0
 
-          zyntax_changed=0
-          gemtype_changed=0
-          pake_changed=0
-          yasb_changed=0
-          brave_free_origin_changed=0
-          komorebi_bundle_changed=0
-          telegram_drive_changed=0
-          qbz_downloader_changed=0
-          marktext_changed=0
-          marktext_fork_seen=0
-          marktext_default_branch=""
-          obs_studio_changed=0
-          obs_fork_seen=0
-          obs_default_branch=""
+          # Each discovered fork is processed separately, so one error does not
+          # prevent the others from being updated.
+          while IFS= read -r fork; do
+            [[ -n "$fork" ]] || continue
+            echo "::group::Fork $fork"
 
-          for repository in "${forks[@]}"; do
-            echo "::group::Syncing $repository"
+            # GitHub tells us the original repository: no repository names to maintain.
+            if ! upstream="$(gh api "repos/$fork" --jq '.parent.full_name // empty')"; then
+              echo "::error::Could not inspect parent for $fork"
+              repo_failed=$((repo_failed + 1))
+              echo "| \`$fork\` | Unknown | 0 | 1 | Failed: no parent metadata |" >> "$GITHUB_STEP_SUMMARY"
+              echo '::endgroup::'
+              continue
+            fi
+            if [[ -z "$upstream" ]]; then
+              echo "::warning::Skipping $fork: original repository was removed or is inaccessible."
+              repo_failed=$((repo_failed + 1))
+              echo "| \`$fork\` | Unavailable | 0 | 1 | Skipped |" >> "$GITHUB_STEP_SUMMARY"
+              echo '::endgroup::'
+              continue
+            fi
+            echo "Original developer repository: $upstream"
 
-            default_branch="$(gh api "repos/$repository" --jq '.default_branch' 2>/dev/null)"
-
-            # These source builders intentionally follow specific branches,
-            # even if the fork's default branch is different.
-            if [[ "${repository#*/}" == "marktext" ]]; then
-              marktext_fork_seen=1
-              marktext_default_branch="$default_branch"
-            elif [[ "${repository#*/}" == "obs-studio" ]]; then
-              obs_fork_seen=1
-              obs_default_branch="$default_branch"
+            # GitHub forks may have a different main/master/develop branch.
+            # Sync every branch already present in BOTH the fork and its parent.
+            # This is generic and covers OBS master or MarkText develop without
+            # hard-coding either application or branch name.
+            if ! gh api --paginate "repos/$fork/branches?per_page=100" \
+                  --jq '.[].name' > "$temp/fork-branches.txt" || \
+               ! gh api --paginate "repos/$upstream/branches?per_page=100" \
+                  --jq '.[].name' > "$temp/upstream-branches.txt"; then
+              echo "::error::Cannot list branches for $fork or $upstream"
+              repo_failed=$((repo_failed + 1))
+              echo "| \`$fork\` | \`$upstream\` | 0 | 1 | Failed: branch listing |" >> "$GITHUB_STEP_SUMMARY"
+              echo '::endgroup::'
+              continue
             fi
 
-            before_sha="$(gh api "repos/$repository/commits/$default_branch" --jq '.sha' 2>/dev/null)"
+            # Intersection, not union: never create arbitrary new branches.
+            comm -12 \
+              <(LC_ALL=C sort -u "$temp/fork-branches.txt") \
+              <(LC_ALL=C sort -u "$temp/upstream-branches.txt") \
+              > "$temp/shared-branches.txt"
 
-            if gh repo sync "$repository" --force; then
-              successes=$((successes + 1))
-              after_sha="$(gh api "repos/$repository/commits/$default_branch" --jq '.sha' 2>/dev/null)"
+            synced_this=0
+            failed_this=0
+            while IFS= read -r branch; do
+              [[ -n "$branch" ]] || continue
+              echo "Syncing $fork @ $branch from $upstream ..."
 
-              echo "Before: ${before_sha:-unknown}"
-              echo "After:  ${after_sha:-unknown}"
-
-              if [[ -n "$before_sha" &&
-                    -n "$after_sha" &&
-                    "$before_sha" != "$after_sha" ]]; then
-
-                case "${repository#*/}" in
-                  ZyntaxAI)
-                    zyntax_changed=1
-                    ;;
-                  GemType)
-                    gemtype_changed=1
-                    ;;
-                  Pake)
-                    pake_changed=1
-                    ;;
-                  yasb)
-                    yasb_changed=1
-                    ;;
-                  Brave-Free-Origin)
-                    brave_free_origin_changed=1
-                    ;;
-                  komorebi|whkd)
-                    komorebi_bundle_changed=1
-                    ;;
-                  Telegram-Drive)
-                    telegram_drive_changed=1
-                    ;;
-                  QBZ-Downloader)
-                    qbz_downloader_changed=1
-                    ;;
-                  marktext)
-                    # MarkText compiles develop, not necessarily default branch.
-                    if [[ "$default_branch" == "develop" ]]; then
-                      marktext_changed=1
-                    fi
-                    ;;
-                  obs-studio)
-                    # OBS meeting builder compiles master, not necessarily default branch.
-                    if [[ "$default_branch" == "master" ]]; then
-                      obs_studio_changed=1
-                    fi
-                    ;;
-                esac
+              if [[ "$FORCE_SYNC" == 'true' ]]; then
+                if gh repo sync "$fork" --source "$upstream" --branch "$branch" --force; then
+                  synced_this=$((synced_this + 1))
+                else
+                  echo "::error::Could not force-sync $fork @ $branch"
+                  failed_this=$((failed_this + 1))
+                fi
+              else
+                # Safe default: never overwrite a diverged or customized branch.
+                if gh repo sync "$fork" --source "$upstream" --branch "$branch"; then
+                  synced_this=$((synced_this + 1))
+                else
+                  echo "::warning::Could not fast-forward $fork @ $branch. A custom change, branch protection or token permission may be blocking sync."
+                  failed_this=$((failed_this + 1))
+                fi
               fi
+            done < "$temp/shared-branches.txt"
+
+            if (( synced_this == 0 && failed_this == 0 )); then
+              echo "::warning::No common branches for $fork and $upstream."
+              result='Skipped: no common branch'
+              repo_failed=$((repo_failed + 1))
+            elif (( failed_this > 0 )); then
+              result='Partial / failed'
+              repo_failed=$((repo_failed + 1))
             else
-              echo "::error::Failed to sync: $repository"
-              failures=$((failures + 1))
+              result='OK'
+              repo_ok=$((repo_ok + 1))
             fi
+            branch_ok=$((branch_ok + synced_this))
+            branch_failed=$((branch_failed + failed_this))
+            echo "| \`$fork\` | \`$upstream\` | $synced_this | $failed_this | $result |" >> "$GITHUB_STEP_SUMMARY"
+            echo '::endgroup::'
+          done < "$temp/forks.txt"
 
-            echo "::endgroup::"
-          done
+          {
+            echo ''
+            echo "**Results:** $repo_ok forks OK, $repo_failed forks with errors/skips; $branch_ok branches synced/checked, $branch_failed branch errors."
+            echo ''
+            echo 'A successful sync updates source branches only. Run each portable builder manually from its own Actions tab.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          # Sync non-default branches used by portable builders.
-          # Do not rebuild from unrelated changes to a fork's default branch.
-          if (( marktext_fork_seen )) && [[ "$marktext_default_branch" != "develop" ]]; then
-            echo "::group::Syncing $owner/marktext develop (builder source branch)"
-            before_develop_sha="$(gh api "repos/$owner/marktext/commits/develop" --jq '.sha' 2>/dev/null)"
-            if [[ -z "$before_develop_sha" ]]; then
-              echo "::error::MarkText develop branch is missing or inaccessible."
-              failures=$((failures + 1))
-            elif gh repo sync "$owner/marktext" --branch develop --force; then
-              after_develop_sha="$(gh api "repos/$owner/marktext/commits/develop" --jq '.sha' 2>/dev/null)"
-              echo "MarkText develop before: $before_develop_sha"
-              echo "MarkText develop after:  ${after_develop_sha:-unknown}"
-              if [[ -z "$after_develop_sha" ]]; then
-                echo "::error::Cannot read MarkText develop commit after sync."
-                failures=$((failures + 1))
-              elif [[ "$before_develop_sha" != "$after_develop_sha" ]]; then
-                marktext_changed=1
-              fi
-            else
-              echo "::error::Failed to sync MarkText develop."
-              failures=$((failures + 1))
-            fi
-            echo "::endgroup::"
-          fi
-
-          if (( obs_fork_seen )) && [[ "$obs_default_branch" != "master" ]]; then
-            echo "::group::Syncing $owner/obs-studio master (builder source branch)"
-            before_master_sha="$(gh api "repos/$owner/obs-studio/commits/master" --jq '.sha' 2>/dev/null)"
-            if [[ -z "$before_master_sha" ]]; then
-              echo "::error::OBS master branch is missing or inaccessible."
-              failures=$((failures + 1))
-            elif gh repo sync "$owner/obs-studio" --branch master --force; then
-              after_master_sha="$(gh api "repos/$owner/obs-studio/commits/master" --jq '.sha' 2>/dev/null)"
-              echo "OBS master before: $before_master_sha"
-              echo "OBS master after:  ${after_master_sha:-unknown}"
-              if [[ -z "$after_master_sha" ]]; then
-                echo "::error::Cannot read OBS master commit after sync."
-                failures=$((failures + 1))
-              elif [[ "$before_master_sha" != "$after_master_sha" ]]; then
-                obs_studio_changed=1
-              fi
-            else
-              echo "::error::Failed to sync OBS master."
-              failures=$((failures + 1))
-            fi
-            echo "::endgroup::"
-          fi
-
-          trigger_standard_builder() {
-            local builder="$1"
-            local source_repo="$2"
-            local source_ref="$3"
-
-            echo "Triggering $owner/$builder from $source_repo@$source_ref"
-
-            if ! gh workflow run build-portable.yml \
-                  --repo "$owner/$builder" \
-                  --ref main \
-                  --raw-field mode=portable-data \
-                  --raw-field upstream_repo="$source_repo" \
-                  --raw-field upstream_ref="$source_ref"; then
-              echo "::error::Could not trigger $builder"
-              failures=$((failures + 1))
-            fi
-          }
-
-          # Dispatch builders that have app-specific workflow/input names.
-          # Keep the old standard builders untouched.
-          trigger_variant_builder() {
-            local builder="$1"
-            local workflow="$2"
-            local source_repo="$3"
-            local source_ref="$4"
-            local repo_key="$5"
-            local ref_key="$6"
-            echo "Triggering $owner/$builder / $workflow from $source_repo@$source_ref"
-            if ! gh workflow run "$workflow" \
-                  --repo "$owner/$builder" \
-                  --ref main \
-                  --raw-field "$repo_key=$source_repo" \
-                  --raw-field "$ref_key=$source_ref"; then
-              echo "::error::Could not trigger $builder / $workflow"
-              failures=$((failures + 1))
-            fi
-          }
-
-          if (( zyntax_changed )); then
-            ref="$(gh api "repos/$owner/ZyntaxAI" --jq '.default_branch')"
-            trigger_standard_builder "ZyntaxAI-Portable-Builder" "$owner/ZyntaxAI" "$ref"
-          fi
-
-          if (( gemtype_changed )); then
-            ref="$(gh api "repos/$owner/GemType" --jq '.default_branch')"
-            trigger_standard_builder "GemType-Portable-Builder" "$owner/GemType" "$ref"
-          fi
-
-          # Pake is a builder for multiple saved apps, so use rebuild-saved
-          # instead of the standard portable-data mode.
-          if (( pake_changed )); then
-            ref="$(gh api "repos/$owner/Pake" --jq '.default_branch')"
-
-            echo "Triggering $owner/Pake-Portable-Builder from $owner/Pake@$ref"
-
-            if ! gh workflow run build-portable.yml \
-                  --repo "$owner/Pake-Portable-Builder" \
-                  --ref main \
-                  --raw-field mode=rebuild-saved \
-                  --raw-field upstream_repo="$owner/Pake" \
-                  --raw-field upstream_ref="$ref"; then
-              echo "::error::Could not trigger Pake-Portable-Builder"
-              failures=$((failures + 1))
-            fi
-          fi
-
-          if (( yasb_changed )); then
-            ref="$(gh api "repos/$owner/yasb" --jq '.default_branch')"
-            trigger_standard_builder "YASB-Portable-Builder" "$owner/yasb" "$ref"
-          fi
-
-          # Brave Free Origin's builder uses source_repo/source_ref rather than
-          # the upstream_repo/upstream_ref fields used by the standard builders.
-          if (( brave_free_origin_changed )); then
-            ref="$(gh api "repos/$owner/Brave-Free-Origin" --jq '.default_branch')"
-
-            echo "Triggering $owner/Brave-Free-Origin-Portable-Builder from $owner/Brave-Free-Origin@$ref"
-
-            if ! gh workflow run build-portable.yml \
-                  --repo "$owner/Brave-Free-Origin-Portable-Builder" \
-                  --ref main \
-                  --raw-field mode=portable-data \
-                  --raw-field source_repo="$owner/Brave-Free-Origin" \
-                  --raw-field source_ref="$ref"; then
-              echo "::error::Could not trigger Brave-Free-Origin-Portable-Builder"
-              failures=$((failures + 1))
-            fi
-          fi
-
-          # komorebi and whkd are one portable bundle. Trigger once if either changed.
-          if (( komorebi_bundle_changed )); then
-            komorebi_ref="$(gh api "repos/$owner/komorebi" --jq '.default_branch')"
-            whkd_ref="$(gh api "repos/$owner/whkd" --jq '.default_branch')"
-
-            echo "Triggering private Komorebi bundle builder"
-
-            if ! gh workflow run build-portable.yml \
-                  --repo "$owner/Komorebi-Portable-Builder" \
-                  --ref main \
-                  --raw-field mode=portable-data \
-                  --raw-field komorebi_repo="$owner/komorebi" \
-                  --raw-field komorebi_ref="$komorebi_ref" \
-                  --raw-field whkd_repo="$owner/whkd" \
-                  --raw-field whkd_ref="$whkd_ref"; then
-              echo "::error::Could not trigger Komorebi-Portable-Builder"
-              failures=$((failures + 1))
-            fi
-          fi
-
-          # Telegram Drive Phase 1 uses filesystem-portable, NOT portable-data.
-          # All other builder modes remain unchanged.
-          if (( telegram_drive_changed )); then
-            ref="$(gh api "repos/$owner/Telegram-Drive" --jq '.default_branch')"
-
-            echo "Triggering $owner/Telegram-Drive-Portable-Builder from $owner/Telegram-Drive@$ref"
-
-            if ! gh workflow run build-portable.yml \
-                  --repo "$owner/Telegram-Drive-Portable-Builder" \
-                  --ref main \
-                  --raw-field mode=filesystem-portable \
-                  --raw-field upstream_repo="$owner/Telegram-Drive" \
-                  --raw-field upstream_ref="$ref"; then
-              echo "::error::Could not trigger Telegram-Drive-Portable-Builder"
-              failures=$((failures + 1))
-            fi
-          fi
-
-          # Telegram Drive's original filesystem-portable standalone trigger
-          # is kept above; also rebuild the independent PAF package.
-          if (( telegram_drive_changed )); then
-            ref="$(gh api "repos/$owner/Telegram-Drive" --jq '.default_branch')"
-            trigger_variant_builder "Telegram-Drive-Portable-Builder" \
-              "build-paf-portable.yml" "$owner/Telegram-Drive" "$ref" \
-              "upstream_repo" "upstream_ref"
-          fi
-
-          # QBZ has two standalone and PAF workflows with upstream_* inputs.
-          if (( qbz_downloader_changed )); then
-            ref="$(gh api "repos/$owner/QBZ-Downloader" --jq '.default_branch')"
-            trigger_variant_builder "QBZ-Downloader-Portable-Builder" \
-              "build-portable.yml" "$owner/QBZ-Downloader" "$ref" \
-              "upstream_repo" "upstream_ref"
-            trigger_variant_builder "QBZ-Downloader-Portable-Builder" \
-              "build-paf-portable.yml" "$owner/QBZ-Downloader" "$ref" \
-              "upstream_repo" "upstream_ref"
-          fi
-
-          # MarkText must be built from synced develop.
-          if (( marktext_changed )); then
-            trigger_variant_builder "MarkText-Portable-Builder" \
-              "build-portable.yml" "$owner/marktext" "develop" \
-              "source_repository" "source_ref"
-            trigger_variant_builder "MarkText-Portable-Builder" \
-              "build-paf-portable.yml" "$owner/marktext" "develop" \
-              "source_repository" "source_ref"
-          fi
-
-          # Custom OBS meeting-recorder build: ONE workflow only.
-          # This OVERRIDES the workflow's fixed verified SHA with the freshly
-          # synced master branch. New upstream code may fail source checks;
-          # that is deliberate and must be inspected, not automatically bypassed.
-          if (( obs_studio_changed )); then
-            trigger_variant_builder "OBS-Portable-Builder" \
-              "build-obs-meeting-portable.yml" "$owner/obs-studio" "master" \
-              "source_repository" "source_ref"
-          fi
-
-          echo
-          echo "Synchronization summary"
-          echo "-----------------------"
-          echo "Forks found: ${#forks[@]}"
-          echo "Successful syncs: $successes"
-          echo "Failures: $failures"
-          echo "ZyntaxAI changed: $zyntax_changed"
-          echo "GemType changed: $gemtype_changed"
-          echo "Pake changed: $pake_changed"
-          echo "YASB changed: $yasb_changed"
-          echo "Brave Free Origin changed: $brave_free_origin_changed"
-          echo "Komorebi/whkd bundle changed: $komorebi_bundle_changed"
-          echo "Telegram Drive changed: $telegram_drive_changed"
-          echo "QBZ-Downloader changed: $qbz_downloader_changed"
-          echo "MarkText develop changed: $marktext_changed"
-          echo "OBS Studio master changed: $obs_studio_changed"
-
-          if (( failures > 0 )); then
+          echo "Forks OK: $repo_ok; forks with issues: $repo_failed"
+          echo "Branches synced/checked: $branch_ok; errors: $branch_failed"
+          if (( repo_failed > 0 )); then
             exit 1
           fi
