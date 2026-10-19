@@ -1,19 +1,16 @@
 name: Universal Fork Sync
 
-# This workflow ONLY updates GitHub forks. It NEVER runs portable builders.
+# MIRROR MODE: automatically overwrite shared fork branches with upstream source.
+# The controller does not dispatch any portable builders.
+# IMPORTANT: custom files/commits on a mirrored branch can be removed, including
+# .github/workflows files. Keep portable builders in separate repositories.
 on:
   schedule:
-    # Every six hours (UTC), matching your original workflow.
+    # Every six hours (UTC), as in the original controller.
     - cron: '17 */6 * * *'
   workflow_dispatch:
-    inputs:
-      force_sync:
-        description: 'DANGER: overwrite conflicting changes in fork branches?'
-        type: boolean
-        default: false
-        required: false
 
-# The separate FORK_SYNC_TOKEN is used for access to all your forks.
+# All fork access comes from the existing FORK_SYNC_TOKEN secret.
 permissions:
   contents: read
 
@@ -23,15 +20,14 @@ concurrency:
 
 jobs:
   sync-forks:
-    name: Automatically discover and sync all my forks
+    name: Automatically discover and force-sync all my forks
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
       GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
-      FORCE_SYNC: ${{ inputs.force_sync || 'false' }}
 
     steps:
-      - name: Find all forks and sync their existing upstream branches
+      - name: Discover forks and mirror their shared upstream branches
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -47,29 +43,29 @@ jobs:
             exit 1
           fi
 
-          temp="$(mktemp -d)"
-          trap 'rm -rf "$temp"' EXIT
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
 
-          # Pagination means new forks are found automatically, even beyond 100 repos.
-          # Include public and private forks accessible to FORK_SYNC_TOKEN.
+          # Auto-discover all active, accessible forks belonging to this account.
+          # Pagination means new forks require no changes to this YAML.
           gh api --paginate 'user/repos?affiliation=owner&per_page=100' \
             --jq '.[] | select(.fork == true and .archived == false and .disabled == false) | .full_name' \
-            > "$temp/forks.txt"
+            > "$tmp/forks.txt"
+          total="$(wc -l < "$tmp/forks.txt" | tr -d ' ')"
 
-          total="$(wc -l < "$temp/forks.txt" | tr -d ' ')"
-          echo "Account: $owner"
+          echo "GitHub account: $owner"
           echo "Active forks found: $total"
-          echo "Force overwrite: $FORCE_SYNC"
+          echo 'Mode: force mirror (--force always enabled)'
 
           {
-            echo '## Universal Fork Sync'
+            echo '## Universal Fork Sync — Force Mirror'
             echo ''
             echo "- GitHub account: \`$owner\`"
             echo "- Active forks discovered: **$total**"
-            echo "- Force overwrite enabled: **$FORCE_SYNC**"
-            echo '- Portable builders launched: **0**'
+            echo '- Sync mode: **Force mirror (overwrite fork branch changes)**'
+            echo '- Portable builders dispatched by this controller: **0**'
             echo ''
-            echo '| Fork | Original developer repo | Synced branches | Failed branches | Result |'
+            echo '| Fork | Original developer repo | Mirrored branches | Failed branches | Result |'
             echo '|---|---|---:|---:|---|'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -78,105 +74,94 @@ jobs:
             exit 0
           fi
 
-          repo_ok=0
-          repo_failed=0
-          branch_ok=0
-          branch_failed=0
+          repos_ok=0
+          repos_failed=0
+          branches_ok=0
+          branches_failed=0
 
-          # Each discovered fork is processed separately, so one error does not
-          # prevent the others from being updated.
           while IFS= read -r fork; do
             [[ -n "$fork" ]] || continue
             echo "::group::Fork $fork"
 
-            # GitHub tells us the original repository: no repository names to maintain.
+            # Always discover the parent; never hard-code repo names.
             if ! upstream="$(gh api "repos/$fork" --jq '.parent.full_name // empty')"; then
-              echo "::error::Could not inspect parent for $fork"
-              repo_failed=$((repo_failed + 1))
-              echo "| \`$fork\` | Unknown | 0 | 1 | Failed: no parent metadata |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::Cannot inspect parent repository for $fork."
+              repos_failed=$((repos_failed + 1))
+              echo "| \`$fork\` | Unknown | 0 | 1 | Failed: parent lookup |" >> "$GITHUB_STEP_SUMMARY"
               echo '::endgroup::'
               continue
             fi
             if [[ -z "$upstream" ]]; then
-              echo "::warning::Skipping $fork: original repository was removed or is inaccessible."
-              repo_failed=$((repo_failed + 1))
-              echo "| \`$fork\` | Unavailable | 0 | 1 | Skipped |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::Original developer repository for $fork is unavailable."
+              repos_failed=$((repos_failed + 1))
+              echo "| \`$fork\` | Unavailable | 0 | 1 | Failed: parent unavailable |" >> "$GITHUB_STEP_SUMMARY"
               echo '::endgroup::'
               continue
             fi
-            echo "Original developer repository: $upstream"
 
-            # GitHub forks may have a different main/master/develop branch.
-            # Sync every branch already present in BOTH the fork and its parent.
-            # This is generic and covers OBS master or MarkText develop without
-            # hard-coding either application or branch name.
+            # Mirror only branches that exist in BOTH repos. This automatically
+            # handles main, master, develop and other shared branch names.
+            # Fork-only builder branches are left alone.
             if ! gh api --paginate "repos/$fork/branches?per_page=100" \
-                  --jq '.[].name' > "$temp/fork-branches.txt" || \
+                  --jq '.[].name' > "$tmp/fork-branches.txt" || \
                ! gh api --paginate "repos/$upstream/branches?per_page=100" \
-                  --jq '.[].name' > "$temp/upstream-branches.txt"; then
-              echo "::error::Cannot list branches for $fork or $upstream"
-              repo_failed=$((repo_failed + 1))
+                  --jq '.[].name' > "$tmp/upstream-branches.txt"; then
+              echo "::error::Cannot list branches for $fork or $upstream."
+              repos_failed=$((repos_failed + 1))
               echo "| \`$fork\` | \`$upstream\` | 0 | 1 | Failed: branch listing |" >> "$GITHUB_STEP_SUMMARY"
               echo '::endgroup::'
               continue
             fi
-
-            # Intersection, not union: never create arbitrary new branches.
             comm -12 \
-              <(LC_ALL=C sort -u "$temp/fork-branches.txt") \
-              <(LC_ALL=C sort -u "$temp/upstream-branches.txt") \
-              > "$temp/shared-branches.txt"
+              <(LC_ALL=C sort -u "$tmp/fork-branches.txt") \
+              <(LC_ALL=C sort -u "$tmp/upstream-branches.txt") \
+              > "$tmp/shared-branches.txt"
 
-            synced_this=0
-            failed_this=0
+            mirrored=0
+            failed=0
             while IFS= read -r branch; do
               [[ -n "$branch" ]] || continue
-              echo "Syncing $fork @ $branch from $upstream ..."
+              echo "Mirroring $fork @ $branch from $upstream (force overwrite enabled) ..."
 
-              if [[ "$FORCE_SYNC" == 'true' ]]; then
-                if gh repo sync "$fork" --source "$upstream" --branch "$branch" --force; then
-                  synced_this=$((synced_this + 1))
-                else
-                  echo "::error::Could not force-sync $fork @ $branch"
-                  failed_this=$((failed_this + 1))
-                fi
+              # Hard reset the fork branch to the upstream branch; this also
+              # fixes the divergent vhick/Pake branch if GitHub permits the push.
+              if gh repo sync "$fork" --source "$upstream" --branch "$branch" --force; then
+                mirrored=$((mirrored + 1))
               else
-                # Safe default: never overwrite a diverged or customized branch.
-                if gh repo sync "$fork" --source "$upstream" --branch "$branch"; then
-                  synced_this=$((synced_this + 1))
-                else
-                  echo "::warning::Could not fast-forward $fork @ $branch. A custom change, branch protection or token permission may be blocking sync."
-                  failed_this=$((failed_this + 1))
-                fi
+                echo "::error::Unable to mirror $fork @ $branch. Check token permissions and branch rules."
+                failed=$((failed + 1))
               fi
-            done < "$temp/shared-branches.txt"
+            done < "$tmp/shared-branches.txt"
 
-            if (( synced_this == 0 && failed_this == 0 )); then
+            if (( mirrored == 0 && failed == 0 )); then
               echo "::warning::No common branches for $fork and $upstream."
               result='Skipped: no common branch'
-              repo_failed=$((repo_failed + 1))
-            elif (( failed_this > 0 )); then
+              repos_failed=$((repos_failed + 1))
+            elif (( failed > 0 )); then
               result='Partial / failed'
-              repo_failed=$((repo_failed + 1))
+              repos_failed=$((repos_failed + 1))
             else
               result='OK'
-              repo_ok=$((repo_ok + 1))
+              repos_ok=$((repos_ok + 1))
             fi
-            branch_ok=$((branch_ok + synced_this))
-            branch_failed=$((branch_failed + failed_this))
-            echo "| \`$fork\` | \`$upstream\` | $synced_this | $failed_this | $result |" >> "$GITHUB_STEP_SUMMARY"
+
+            branches_ok=$((branches_ok + mirrored))
+            branches_failed=$((branches_failed + failed))
+            echo "| \`$fork\` | \`$upstream\` | $mirrored | $failed | $result |" >> "$GITHUB_STEP_SUMMARY"
             echo '::endgroup::'
-          done < "$temp/forks.txt"
+          done < "$tmp/forks.txt"
 
           {
             echo ''
-            echo "**Results:** $repo_ok forks OK, $repo_failed forks with errors/skips; $branch_ok branches synced/checked, $branch_failed branch errors."
+            echo "**Results:** $repos_ok forks OK, $repos_failed forks with issues; $branches_ok branches mirrored/checked, $branches_failed failed branch syncs."
             echo ''
-            echo 'A successful sync updates source branches only. Run each portable builder manually from its own Actions tab.'
+            echo 'Only branches present in both the fork and parent are mirrored. Fork-only branches, new upstream-only branches, and tags are not synced.'
+            echo ''
+            echo 'The controller does not dispatch portable-builder workflows. However, PAT-authored pushes CAN trigger workflows listening to `push`.'
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "Forks OK: $repo_ok; forks with issues: $repo_failed"
-          echo "Branches synced/checked: $branch_ok; errors: $branch_failed"
-          if (( repo_failed > 0 )); then
+          echo "Forks OK: $repos_ok; forks with issues: $repos_failed"
+          echo "Branches mirrored/checked: $branches_ok; errors: $branches_failed"
+          if (( repos_failed > 0 )); then
             exit 1
           fi
