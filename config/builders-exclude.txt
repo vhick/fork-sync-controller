@@ -1,0 +1,3 @@
+# Optional: one repository per line to protect from cleanup.
+# Example:
+# My-Test-Builder

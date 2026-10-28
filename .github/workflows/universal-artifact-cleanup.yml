@@ -1,0 +1,50 @@
+name: Universal Builder Artifact Cleanup
+
+on:
+  # A short daily check is used so cleanup happens every 3 days across
+  # month/year boundaries (unlike a cron expression using */3 for dates).
+  schedule:
+    - cron: '23 4 * * *'  # 04:23 UTC / 12:23 Singapore time
+
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview only (no artifacts deleted)'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: universal-builder-artifact-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Find and clean builder artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      ARTIFACT_CLEANUP_TOKEN: ${{ secrets.ARTIFACT_CLEANUP_TOKEN }}
+      BUILDER_OWNER: ${{ github.repository_owner }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
+      MANUAL_RUN: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
+      CLEANUP_ANCHOR_DATE: '2026-10-28'
+      CLEANUP_EVERY_DAYS: '3'
+      # Only repositories with 'builder' in their name are detected automatically.
+      # Repositories without that word can be included in config/builders-extra.txt.
+      BUILDER_NAME_REGEX: '(?i)builder'
+      # 0 = delete ALL artifacts. Set to 1 to keep newest artifact per repository.
+      KEEP_LATEST_PER_REPO: '0'
+      # 0 = no age restriction. Set to 24 to preserve artifacts made in last 24h.
+      MIN_AGE_HOURS: '0'
+    steps:
+      - name: Check out controller repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run universal artifact cleanup
+        run: python3 scripts/cleanup_builder_artifacts.py

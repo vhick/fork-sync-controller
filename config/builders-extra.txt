@@ -1,0 +1,5 @@
+# Optional: add one repository name per line if the name does NOT contain 'builder'.
+# Examples (delete the # only when needed):
+# My-Portable-App
+# vhick/Another-Portable-App
+# The token must also have Actions: Read and Write access to each repository.
