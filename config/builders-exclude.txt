@@ -1,3 +1,4 @@
-# Optional: one repository per line to protect from cleanup.
-# Example:
-# My-Test-Builder
+# ALWAYS protected from cleanup, including manual selection.
+# One repository name per line. Examples:
+# fork-sync-controller
+# important-releases-archive

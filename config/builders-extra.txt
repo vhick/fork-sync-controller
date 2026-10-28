@@ -1,5 +1,5 @@
-# Optional: add one repository name per line if the name does NOT contain 'builder'.
-# Examples (delete the # only when needed):
-# My-Portable-App
-# vhick/Another-Portable-App
-# The token must also have Actions: Read and Write access to each repository.
+# Optional: repositories to INCLUDE when selecting builders or builders_and_forks.
+# One repo per line (can include vhick/ prefix). Manual keyword and specific
+# repository modes do not use this file.
+# Example:
+# my-custom-portable-build

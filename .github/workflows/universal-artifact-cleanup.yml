@@ -1,18 +1,63 @@
-name: Universal Builder Artifact Cleanup
+name: Universal Builder and Fork Cleanup
 
 on:
-  # A short daily check is used so cleanup happens every 3 days across
-  # month/year boundaries (unlike a cron expression using */3 for dates).
   schedule:
-    - cron: '23 4 * * *'  # 04:23 UTC / 12:23 Singapore time
-
+    # Daily lightweight check; actually deletes every 3 days from anchor date.
+    - cron: '23 4 * * *' # 12:23 PM Singapore time
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Preview only (no artifacts deleted)'
-        required: true
-        default: true
+        description: 'PREVIEW only: show what would be deleted'
         type: boolean
+        default: true
+        required: true
+      target_mode:
+        description: 'Which repositories? scheduled_policy_preview checks exact automatic policy safely'
+        type: choice
+        options:
+          - builders_and_forks
+          - builders
+          - forks
+          - keyword
+          - specific_repos
+          - scheduled_policy_preview
+        default: builders_and_forks
+        required: true
+      keywords:
+        description: 'Keyword mode only: words in repository names, comma separated'
+        type: string
+        required: false
+      repositories:
+        description: 'Specific repos only: e.g. etkg, FileOptimizer-Portable-Builder'
+        type: string
+        required: false
+      delete_artifacts:
+        description: 'Clean old ZIP/build artifacts'
+        type: boolean
+        default: true
+        required: true
+      delete_logs:
+        description: 'Clean old workflow run logs (preserves run history)'
+        type: boolean
+        default: false
+        required: true
+      delete_caches:
+        description: 'Clean stale dependency caches'
+        type: boolean
+        default: false
+        required: true
+      artifact_age_hours:
+        description: 'Minimum artifact age (hours), 0 includes fresh artifacts'
+        type: string
+        default: '72'
+      log_age_days:
+        description: 'Minimum age of completed workflow run logs (days)'
+        type: string
+        default: '14'
+      cache_idle_days:
+        description: 'Minimum time since cache last accessed (days)'
+        type: string
+        default: '14'
 
 permissions:
   contents: read
@@ -23,28 +68,47 @@ concurrency:
 
 jobs:
   cleanup:
-    name: Find and clean builder artifacts
+    name: Find and clean eligible Actions storage
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     env:
       ARTIFACT_CLEANUP_TOKEN: ${{ secrets.ARTIFACT_CLEANUP_TOKEN }}
-      BUILDER_OWNER: ${{ github.repository_owner }}
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
-      MANUAL_RUN: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
+      CLEANUP_OWNER: ${{ github.repository_owner }}
+      MANUAL_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+      MANUAL_DRY_RUN: ${{ inputs.dry_run }}
+      MANUAL_TARGET_MODE: ${{ inputs.target_mode }}
+      MANUAL_KEYWORDS: ${{ inputs.keywords }}
+      MANUAL_REPOSITORIES: ${{ inputs.repositories }}
+      MANUAL_DELETE_ARTIFACTS: ${{ inputs.delete_artifacts }}
+      MANUAL_DELETE_LOGS: ${{ inputs.delete_logs }}
+      MANUAL_DELETE_CACHES: ${{ inputs.delete_caches }}
+      MANUAL_ARTIFACT_AGE_HOURS: ${{ inputs.artifact_age_hours }}
+      MANUAL_LOG_AGE_DAYS: ${{ inputs.log_age_days }}
+      MANUAL_CACHE_IDLE_DAYS: ${{ inputs.cache_idle_days }}
       CLEANUP_ANCHOR_DATE: '2026-10-28'
       CLEANUP_EVERY_DAYS: '3'
-      # Only repositories with 'builder' in their name are detected automatically.
-      # Repositories without that word can be included in config/builders-extra.txt.
       BUILDER_NAME_REGEX: '(?i)builder'
-      # 0 = delete ALL artifacts. Set to 1 to keep newest artifact per repository.
-      KEEP_LATEST_PER_REPO: '0'
-      # 0 = no age restriction. Set to 24 to preserve artifacts made in last 24h.
-      MIN_AGE_HOURS: '0'
+      # Manual mode protects newest artifact by default; scheduled eventually clears all old ZIPs.
+      KEEP_LATEST_PER_REPO: '1'
+      SCHEDULED_KEEP_LATEST_PER_REPO: '0'
+      # Scheduled cleanup includes owned builders ONLY (name contains builder or listed as extra).
+      # Other developer forks remain available for manual cleanup.
+      SCHEDULED_TARGET_MODE: 'builders'
+      SCHEDULED_ARTIFACT_AGE_HOURS: '72'
+      SCHEDULED_LOG_AGE_DAYS: '7'
+      SCHEDULED_CACHE_IDLE_DAYS: '15'
+      SCHEDULED_DELETE_ARTIFACTS: 'true'
+      # Automatic maintenance: completed run logs >7 days and caches idle >15 days.
+      SCHEDULED_DELETE_LOGS: 'true'
+      SCHEDULED_DELETE_CACHES: 'true'
+      # Limit deletions of run logs per repository per execution to avoid API abuse.
+      MAX_LOGS_PER_REPO: '100'
+      # Exclude the controller itself, even if you change the discovery filter.
+      CONTROLLER_REPOSITORY: ${{ github.event.repository.name }}
     steps:
       - name: Check out controller repository
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-
-      - name: Run universal artifact cleanup
+      - name: Run universal cleanup
         run: python3 scripts/cleanup_builder_artifacts.py

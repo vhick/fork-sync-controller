@@ -1,114 +1,136 @@
-UNIVERSAL BUILDER ARTIFACT CLEANUP - READY-TO-USE KIT
-======================================================
-For your PUBLIC Universal Fork Sync Controller repository.
+UNIVERSAL BUILDER + FORK CLEANUP v1.2
+===================================
+Scheduled builder-only maintenance + flexible manual cleanup.
+Designed for: https://github.com/vhick/fork-sync-controller
 
-WHAT IT DOES
-------------
-- Performs a tiny scheduled check every day at 04:23 UTC (12:23 Singapore).
-- ACTUALLY CLEANS every 3 days, counting from October 28, 2026 UTC.
-  This stays consistent across month and year boundaries.
-- Finds repositories YOU OWN whose names contain "builder" (case-insensitive).
-- Deletes ALL Actions artifacts in those repositories (both old and new).
-- Does NOT delete source code, workflow definitions, Releases, GitHub Packages,
-  workflow run logs, or caches.
-- Offers a manual safe preview (Dry Run) before doing actual deletions.
-- Produces a per-repository cleanup report on the workflow run page.
-- Does not upload any artifacts of its own.
+UPGRADE FROM YOUR WORKING v1.1
+------------------------------
+1. In GitHub Desktop, open the fork-sync-controller repository.
+2. Choose Repository -> Show in Explorer.
+3. Save a backup of these existing files, if customized:
+   .github/workflows/universal-artifact-cleanup.yml
+   scripts/cleanup_builder_artifacts.py
+4. Extract this ZIP. Copy .github, scripts, config, and tests into the root
+   of the local repo. MERGE folders; never delete the existing .github folder.
+5. Only replace the matching cleanup workflow / Python files. Keep any custom
+   entries in config/builders-extra.txt and config/builders-exclude.txt.
+6. GitHub Desktop -> commit changed files -> Push origin.
+7. Your original 6-hour fork-sync workflow is untouched.
+8. Keep existing ARTIFACT_CLEANUP_TOKEN secret; no need to create a classic PAT
+   if the fine-grained token has Actions: write on all of your repositories.
 
-IMPORTANT
----------
-Artifact deletions are PERMANENT. Download any portable ZIP you want to
-keep first. A freshly created ZIP may also be deleted on cleanup day.
-Deletion frees stored space, but GitHub's monthly accrued billing meter
-may take time to update or only reset at the next billing cycle.
+WHAT AUTOMATIC CLEANUP DOES
+--------------------------
+- Every 3 days it automatically discovers all active, owned builder repositories:
+  names containing 'builder' (case-insensitive), plus the names explicitly
+  listed in config/builders-extra.txt.
+- Excludes all other repositories, including developer forks such as vhick/etkg,
+  unless they contain 'builder' in the name or are explicitly listed as extra.
+- Deletes ALL artifacts at least 72 hours old (including newest IF old enough).
+- Deletes logs of COMPLETED workflow runs last updated at least 7 days ago;
+  history of run records remains, logs cannot be recovered.
+- Deletes caches whose last_accessed_at is at least 15 days ago.
+- Never deletes workflow runs, source code, GitHub Releases, branches, tags,
+  Packages, or the sync controller's own files.
+- New builder repositories are included on the next scheduled cleanup once
+  authorized by the existing fine-grained token (All repositories access).
+- No stored artifacts are protected FOREVER automatically: the latest artifact
+  becomes eligible when it reaches age 72h. Downloads must happen before then.
 
-SETUP USING GITHUB DESKTOP (NO FORK REQUIRED)
----------------------------------------------
-1. In GitHub Desktop, select your existing Universal Fork Sync Controller repo.
-   If not downloaded locally, use File > Clone repository.
-2. Choose Repository > Show in Explorer.
-3. Unzip this kit. Copy the .github, scripts and config folders into the
-   ROOT of the local controller repository. IMPORTANT: .github is a hidden
-   dot-folder and must be included.
-4. In GitHub Desktop, review the new files, enter a commit message such as
-   "Add automatic builder artifact cleanup", then click Commit to main.
-   Click Push origin.
-
-CREATE THE REQUIRED FINE-GRAINED GITHUB TOKEN
----------------------------------------------
-5. While signed into GitHub, open:
-   https://github.com/settings/personal-access-tokens/new
-6. Token name: Portable Builder Artifact Cleanup
-7. Resource owner: YOUR GitHub account, the owner of your builders.
-8. Repository access: "Only select repositories".
-   Select EVERY builder repository you want cleaned. This is safer than
-   granting access to all repositories. New builder repos must be added to
-   this token's selected repositories later.
-9. Repository permissions > Actions > Read and write.
-   Metadata read is provided automatically.
-   Do NOT grant Contents write or Administration write.
-10. Choose an expiration you can maintain; when it expires, update the token.
-    Generate token and COPY it. Never put it in repo files or commit history.
-11. Open your CONTROLLER repository on github.com and select:
-    Settings > Secrets and variables > Actions > New repository secret.
-    Secret name EXACTLY: ARTIFACT_CLEANUP_TOKEN
-    Secret value: paste the token. Click Add secret.
-
-PREVIEW, THEN ENABLE
---------------------
-12. Open controller repository > Actions > Universal Builder Artifact Cleanup.
-13. Click Run workflow. Leave "Preview only" checked. Run.
-14. Open the completed run and inspect its Summary. Check which repositories
-    and how many artifacts WOULD be deleted.
-15. If it looks right, use Run workflow again with "Preview only" unchecked
-    to do an immediate cleanup. Otherwise, simply leave it scheduled.
-16. Scheduled runs automatically perform REAL deletion on cleanup days.
-    Other scheduled days only check the date and exit quickly.
-
-ADDING OR PROTECTING REPOSITORIES
---------------------------------
-- By default, the cleaner targets repos whose names contain "builder".
-- To include a builder repo without that word in its name, add its name to
-  config/builders-extra.txt. ALSO add that repo to the token access list.
-- To protect a matched repo, add it to config/builders-exclude.txt.
-- A repo must belong to your account and be accessible to the token.
-- If your controller is under a DIFFERENT account than your builders, edit
-  BUILDER_OWNER in .github/workflows/universal-artifact-cleanup.yml to
-  your builder owner username. The token's resource owner must match too.
-
-OPTIONAL SETTINGS IN THE WORKFLOW FILE
---------------------------------------
-- CLEANUP_EVERY_DAYS: '3'  -> change cleanup interval.
-- CLEANUP_ANCHOR_DATE: '2026-10-28' -> date on which cycle starts (UTC).
-- BUILDER_NAME_REGEX: '(?i)builder' -> name filter for auto-discovery.
-- KEEP_LATEST_PER_REPO: '0' -> zero deletes ALL artifacts. '1' keeps latest.
-- MIN_AGE_HOURS: '0' -> zero deletes regardless of age; '24' protects last day.
-
-WHEN THERE IS A PROBLEM
------------------------
-- "Missing secret": check secret name ARTIFACT_CLEANUP_TOKEN.
-- HTTP 403: token lacks Actions Read/Write for the named repository, or
-  a GitHub permission/rate limit policy is blocking it.
-- HTTP 404: repository may be inaccessible to the token, or renamed.
-- "No builder repositories found": check builder names, token repository
-  selection, and owner. A manual extra name may help.
-- If scheduled workflows stop: GitHub can disable scheduled workflows in
-  a public repository after 60 days of repository inactivity. Re-enable in
-  the Actions tab, or make a repository commit as appropriate.
-- Scheduled runs may be delayed/dropped during high GitHub Actions load.
-
-NOTES ABOUT BILLING
+SCHEDULED FREQUENCY
 -------------------
-- Normal GitHub-hosted runners for PUBLIC repositories do not consume
-  your included private-repository Actions minutes.
-- Deleting artifacts reduces stored bytes. Monthly usage is a separate
-  billing measure, so the dashboard is not necessarily immediately zero.
-- GitHub Releases assets are NOT deleted by this script.
+The workflow runs a tiny daily check at 04:23 UTC (12:23 in Singapore) and
+performs cleanup every 3 days from 2026-10-28 UTC. This avoids the '*/3' cron
+trap: 'every 3rd day of month' restarts its count on the 1st of each month.
+GitHub schedules can be delayed or dropped under heavy load; this is
+best-effort periodic maintenance, not guaranteed execution at the exact minute.
 
-SOURCES (OFFICIAL GITHUB DOCUMENTATION)
----------------------------------------
+HOW TO PREVIEW EXACT AUTOMATIC POLICY (BEFORE FIRST RUN)
+--------------------------------------------------------
+1. On GitHub: fork-sync-controller -> Actions -> Universal Builder and Fork Cleanup
+   -> Run workflow.
+2. Set target_mode to 'scheduled_policy_preview'.
+3. Keep any dry-run checkbox setting (preview mode FORCES dry-run even if unchecked).
+4. Run workflow and open the job summary.
+5. It will show EXACTLY which builder repositories and objects qualify under
+   the scheduled settings, without deleting anything.
+   Note: Preview counts can change before the future cleanup date.
+6. The next automatic cycle will delete the qualifying objects.
+
+MANUAL CLEANUP STILL WORKS AS IN v1.1
+------------------------------------
+- Existing modes unchanged: builders_and_forks, builders, forks, keyword,
+  specific_repos; newly added: scheduled_policy_preview.
+- Existing manual booleans and age thresholds remain unchanged.
+- Manual mode retains newest artifact per repository (KEEP_LATEST_PER_REPO=1).
+- Manual default: PREVIEW ONLY, artifacts true, logs false, caches false,
+  min artifact age 72h, min log age 14d, min cache idle 14d.
+- Use manual mode to clean developer forks, such as etkg.
+- Explicitly excluded repos are excluded even when requested manually.
+
+ADJUST AUTOMATIC RULES IF NEEDED
+--------------------------------
+Edit .github/workflows/universal-artifact-cleanup.yml:
+ SCHEDULED_TARGET_MODE: 'builders'          # builders only (recommended)
+ SCHEDULED_ARTIFACT_AGE_HOURS: '72'         # keep ZIPs for 3 days
+ SCHEDULED_KEEP_LATEST_PER_REPO: '0'        # allow every ZIP to expire
+ SCHEDULED_LOG_AGE_DAYS: '7'               # allow a week to troubleshoot
+ SCHEDULED_CACHE_IDLE_DAYS: '15'           # delete only old unused caches
+ SCHEDULED_DELETE_ARTIFACTS: 'true'
+ SCHEDULED_DELETE_LOGS: 'true'
+ SCHEDULED_DELETE_CACHES: 'true'
+ CLEANUP_EVERY_DAYS: '3'
+ MAX_LOGS_PER_REPO: '100'                  # avoids excessive API requests
+
+If you need to keep failed logs longer, set SCHEDULED_LOG_AGE_DAYS to '14'.
+If you want build ZIPs for longer, set ARTIFACT_AGE_HOURS to '120' (5 days)
+or '168' (7 days). Download important ZIPs before automatic deletion.
+
+WHY WE USE THESE LIMITS
+-----------------------
+- GitHub's default cache eviction for unused caches is 7 days. A 15-day
+  manual maintenance pass may find none unless you changed that retention.
+- Cache storage is a separate 10 GB per-repository allowance on Free, not
+  the shared 500 MB artifacts-and-packages pool.
+- GitHub Free's public repositories using standard hosted runners do not
+  consume the 2,000 included monthly Actions minutes. Larger runners differ.
+- Deleting artifacts reduces CURRENT storage; already accrued monthly storage
+  does not reverse.
+- GitHub's own per-repository retention settings and artifact retention-days
+  can reduce storage more cheaply than waiting for the controller.
+- If the repo stays inactive for 60 days, GitHub can disable scheduled workflows
+  on public repositories; check the Actions page periodically.
+
+REPOSITORY SELECTION
+--------------------
+Names containing 'builder' are found automatically. Extra builder names go in
+config/builders-extra.txt (one per line); exclusions go in
+config/builders-exclude.txt. The controller repository always is excluded.
+Set token resource owner 'vhick', Repository access: 'All repositories',
+Repository Actions permission: 'Read and write'. Store ONLY as a repository
+secret named ARTIFACT_CLEANUP_TOKEN; never paste it in committed files.
+Fine-grained All repositories avoids broader classic PAT permissions.
+
+CLEANUP REPORTS & LIMITATIONS
+-----------------------------
+The Actions job summary reports candidate/deleted artifact/log/cache counts,
+per-repository outcomes, and estimated artifact+cache bytes from API metadata.
+GitHub does not provide individual workflow log sizes in this API response;
+do not treat log counts as log-byte savings. Cache bytes are a SEPARATE quota.
+
+To limit REST calls, only 100 eligible completed-run logs per repository are
+removed per cycle by default. If you have a large backlog, a few cycles may be
+needed; errors are surfaced and partial cleanup is possible.
+
+This ZIP was locally tested with simulated GitHub API calls. An actual run
+against your GitHub account has NOT been performed here. Always use the
+scheduled_policy_preview option before letting the new policy delete items.
+
+OFFICIAL SOURCES
+----------------
 https://docs.github.com/en/rest/actions/artifacts
-https://docs.github.com/en/rest/repos/repos
-https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
+https://docs.github.com/en/rest/actions/workflow-runs
+https://docs.github.com/en/rest/actions/cache
+https://docs.github.com/en/billing/concepts/product-billing/github-actions
+https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching
 https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows
-https://docs.github.com/en/actions/how-tos/manage-workflow-runs/remove-workflow-artifacts
